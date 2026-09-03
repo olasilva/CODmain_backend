@@ -1,0 +1,10 @@
+const express = require('express');
+const controller = require('../controllers/genericController');
+const { authenticateToken } = require('../middleware/auth');
+const router = express.Router();
+router.use(authenticateToken);
+router.get('/', controller.list('assignments'));
+router.post('/', controller.create('assignment'));
+router.put('/:id', controller.update('assignment'));
+router.delete('/:id', controller.remove('assignment'));
+module.exports = router;
