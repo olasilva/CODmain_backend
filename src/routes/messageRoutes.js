@@ -1,0 +1,10 @@
+const express = require('express');
+const controller = require('../controllers/messageController');
+const { authenticateToken } = require('../middleware/auth');
+const router = express.Router();
+router.use(authenticateToken);
+router.get('/', controller.getMessages);
+router.post('/', controller.sendMessage);
+router.put('/:messageId/read', controller.markAsRead);
+router.get('/unread-count', controller.getUnreadCount);
+module.exports = router;
