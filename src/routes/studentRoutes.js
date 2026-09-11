@@ -1,3 +1,4 @@
+// src/routes/studentRoutes.js
 const express = require('express');
 const studentController = require('../controllers/studentController');
 const notificationController = require('../controllers/notificationController');
@@ -6,6 +7,22 @@ const settingsController = require('../controllers/settingsController');
 const { authenticateToken } = require('../middleware/auth');
 
 const router = express.Router();
+
+// ─────────── DIAGNOSTIC ───────────
+console.log('🔵 [studentRoutes] studentController type:', typeof studentController);
+console.log('🔵 [studentRoutes] studentController keys:', Object.getOwnPropertyNames(studentController));
+console.log('🔵 [studentRoutes] has getProfile:', typeof studentController.getProfile);
+console.log('🔵 [studentRoutes] has getCourses:', typeof studentController.getCourses);
+// ──────────────────────────────────
+
+// Defensive check — fail fast with a clear message
+if (typeof studentController.getProfile !== 'function') {
+  throw new Error(
+    '❌ studentController.getProfile is not a function. ' +
+    'Check that studentController.js ends with `module.exports = new StudentController();` ' +
+    'and that the class has a getProfile method.'
+  );
+}
 
 // Profile
 router.get('/profile', authenticateToken, studentController.getProfile);
