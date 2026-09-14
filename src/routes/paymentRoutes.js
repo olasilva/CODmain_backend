@@ -1,11 +1,19 @@
+// src/routes/paymentRoutes.js
 const express = require('express');
+const router = express.Router();
 const paymentController = require('../controllers/paymentController');
 const { authenticateToken } = require('../middleware/auth');
 
-const router = express.Router();
+// Authenticated — user starts a Paystack payment
+router.post('/initialize', authenticateToken, paymentController.initializePayment);
 
-router.post('/create-intent', authenticateToken, paymentController.createPaymentIntent);
-router.post('/webhook', express.raw({ type: 'application/json' }), paymentController.handleWebhook);
+// Public — Paystack redirects the user's browser here (no JWT)
+router.get('/verify', paymentController.verifyPayment);
+
+// Public — Paystack posts server-to-server (signature is verified inside)
+router.post('/webhook', paymentController.paystackWebhook);
+
+// Authenticated — payment history and invoices
 router.get('/history', authenticateToken, paymentController.getPaymentHistory);
 router.get('/invoices', authenticateToken, paymentController.getInvoices);
 

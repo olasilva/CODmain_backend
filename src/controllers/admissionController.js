@@ -1,12 +1,16 @@
+// src/controllers/admissionController.js
 const supabaseService = require('../services/supabaseService');
 
 class AdmissionController {
   // =========================================================
-  // POST /api/admissions  — Start new admission
-  // Accepts the payload from CompleteApplication.jsx
+  // POST /api/admissions/start — Start new admission
+  // Handles both the nested shape from CompleteApplication.jsx
+  // and any future flat shape.
   // =========================================================
   async startAdmission(req, res) {
     try {
+      console.log('📥 [startAdmission] req.body:', JSON.stringify(req.body, null, 2));
+
       const userId = req.user?.id;
       if (!userId) {
         return res.status(401).json({
@@ -15,36 +19,61 @@ class AdmissionController {
         });
       }
 
-      // Accept BOTH shapes: the new flat form OR legacy nested form
-      const {
-        // New flat shape (from CompleteApplication.jsx)
-        studentName,
-        dob,
-        gender,
-        nationality,
-        previousSchool,
-        guardianName,
-        guardianEmail,
-        guardianPhone,
-        homeAddress,
-        medicalNotes,
+      const body = req.body || {};
+      const personal = body.personalInfo || {};
+      const academic = body.academicInfo || {};
+
+      // ─── Resolve every field across all supported shapes ───
+      const studentName =
+        personal.fullName || personal.studentName || body.studentName;
+      const dob =
+        personal.dateOfBirth || personal.dob || body.dob;
+      const gender =
+        personal.gender || body.gender;
+      const nationality =
+        personal.nationality || body.nationality;
+      const previousSchool =
+        personal.previousSchool || body.previousSchool;
+      const guardianName =
+        personal.guardianName || body.guardianName;
+      const guardianEmail =
+        personal.guardianEmail || body.guardianEmail;
+      const guardianPhone =
+        personal.guardianPhone || body.guardianPhone;
+      const homeAddress =
+        personal.homeAddress || body.homeAddress;
+      const medicalNotes =
+        personal.medicalNotes || body.medicalNotes;
+
+      const course =
+        academic.course || body.course || body.campus || body.programme;
+      const trackName =
+        academic.trackName || body.trackName || body.track;
+
+      const academicYear =
+        body.academicYear || new Date().getFullYear().toString();
+      const programmeId =
+        body.programmeId || null;
+
+      console.log('📚 Resolved:', {
         course,
         trackName,
-        // Legacy nested shape
+        studentName,
+        guardianName,
         programmeId,
-        academicYear,
-        personalInfo,
-        academicInfo,
-      } = req.body;
+      });
 
-      console.log('📝 Starting admission for user:', userId);
-      console.log('📚 Received:', { studentName, course, trackName, programmeId });
-
-      // Validate required fields (only what we truly need)
+      // ─── Validation ───
       if (!course || !trackName) {
         return res.status(400).json({
           success: false,
           error: 'Course and track name are required',
+          received: {
+            course: course ?? null,
+            trackName: trackName ?? null,
+            bodyKeys: Object.keys(body),
+            academicKeys: Object.keys(academic),
+          },
         });
       }
 
@@ -52,6 +81,14 @@ class AdmissionController {
         return res.status(400).json({
           success: false,
           error: 'Missing required student or guardian fields',
+          received: {
+            studentName: studentName ?? null,
+            guardianName: guardianName ?? null,
+            guardianEmail: guardianEmail ?? null,
+            guardianPhone: guardianPhone ?? null,
+            homeAddress: homeAddress ?? null,
+            personalKeys: Object.keys(personal),
+          },
         });
       }
 
@@ -66,7 +103,7 @@ class AdmissionController {
           user_id: userId,
           student_id: `STU-${Date.now()}`,
           full_name: studentName,
-          academic_year: academicYear || new Date().getFullYear().toString(),
+          academic_year: academicYear,
           status: 'active',
           created_at: new Date().toISOString(),
         };
@@ -114,8 +151,7 @@ class AdmissionController {
       const admissionNumber = `ADM-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
 
       // -----------------------------------------------------
-      // 4. Build admission row (only fields that exist in your table)
-      //    The SQL schema below creates exactly these columns.
+      // 4. Build the admission row
       // -----------------------------------------------------
       const admissionData = {
         student_id: student.id,
@@ -132,7 +168,7 @@ class AdmissionController {
         medical_notes: medicalNotes || null,
         course,
         track_name: trackName,
-        academic_year: academicYear || new Date().getFullYear().toString(),
+        academic_year: academicYear,
         status: 'pending',
         created_at: new Date().toISOString(),
       };
