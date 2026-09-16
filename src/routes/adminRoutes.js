@@ -33,4 +33,7 @@ router.get('/payments', adminController.getPayments);
 // Reports
 router.get('/reports', adminController.getReports);
 
+// Staff
+router.get('/staff', adminController.getStaff);
+
 module.exports = router;
