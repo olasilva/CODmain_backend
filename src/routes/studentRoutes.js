@@ -1,71 +1,58 @@
 // src/routes/studentRoutes.js
 const express = require('express');
+const router = express.Router();
 const studentController = require('../controllers/studentController');
 const notificationController = require('../controllers/notificationController');
 const messageController = require('../controllers/messageController');
 const settingsController = require('../controllers/settingsController');
 const { authenticateToken } = require('../middleware/auth');
 
-const router = express.Router();
-
-// ─────────── DIAGNOSTIC ───────────
-console.log('🔵 [studentRoutes] studentController type:', typeof studentController);
-console.log('🔵 [studentRoutes] studentController keys:', Object.getOwnPropertyNames(studentController));
-console.log('🔵 [studentRoutes] has getProfile:', typeof studentController.getProfile);
-console.log('🔵 [studentRoutes] has getCourses:', typeof studentController.getCourses);
-// ──────────────────────────────────
-
-// Defensive check — fail fast with a clear message
-if (typeof studentController.getProfile !== 'function') {
-  throw new Error(
-    '❌ studentController.getProfile is not a function. ' +
-    'Check that studentController.js ends with `module.exports = new StudentController();` ' +
-    'and that the class has a getProfile method.'
-  );
-}
-
-// Profile
+// ─── Profile ───
 router.get('/profile', authenticateToken, studentController.getProfile);
 router.put('/profile', authenticateToken, studentController.updateProfile);
 
-// Courses
+// ─── My programme & classes (from admission) ───
+router.get('/my-programme', authenticateToken, studentController.getMyProgramme);
+router.get('/my-classes', authenticateToken, studentController.getMyEnrolledClasses);
+
+// ─── Courses (legacy, kept for compat) ───
 router.get('/courses', authenticateToken, studentController.getCourses);
 router.get('/courses/:courseId', authenticateToken, studentController.getCourseDetails);
 
-// Assignments
+// ─── Assignments ───
 router.get('/assignments', authenticateToken, studentController.getAssignments);
 router.get('/assignments/:assignmentId', authenticateToken, studentController.getAssignmentDetails);
 router.post('/assignments/:assignmentId/submit', authenticateToken, studentController.submitAssignment);
 
-// Classes
+// ─── Classes ───
 router.get('/classes', authenticateToken, studentController.getClasses);
 router.get('/classes/:classId', authenticateToken, studentController.getClassDetails);
 
-// Results
+// ─── Results ───
 router.get('/results', authenticateToken, studentController.getResults);
 router.get('/results/:resultId', authenticateToken, studentController.getResultDetails);
 
-// Payments
+// ─── Payments ───
 router.get('/payments', authenticateToken, studentController.getPayments);
 router.get('/payments/:paymentId', authenticateToken, studentController.getPaymentDetails);
 
-// Notifications
+// ─── Notifications ───
 router.get('/notifications', authenticateToken, notificationController.getNotifications);
 router.put('/notifications/:notificationId/read', authenticateToken, notificationController.markAsRead);
 router.put('/notifications/read-all', authenticateToken, notificationController.markAllAsRead);
 
-// Messages
+// ─── Messages ───
+router.get('/messages/unread-count', authenticateToken, messageController.getUnreadCount);
+router.put('/messages/:messageId/read', authenticateToken, messageController.markAsRead);
 router.get('/messages', authenticateToken, messageController.getMessages);
 router.post('/messages', authenticateToken, messageController.sendMessage);
-router.put('/messages/:messageId/read', authenticateToken, messageController.markAsRead);
-router.get('/messages/unread-count', authenticateToken, messageController.getUnreadCount);
 
-// Settings
+// ─── Settings ───
 router.get('/settings', authenticateToken, settingsController.getSettings);
 router.put('/settings', authenticateToken, settingsController.updateSettings);
 router.put('/settings/privacy', authenticateToken, settingsController.updatePrivacy);
 
-// Course Materials
+// ─── Materials ───
 router.get('/materials/:classId', authenticateToken, studentController.getMaterials);
 router.get('/materials/:classId/:materialId', authenticateToken, studentController.getMaterial);
 

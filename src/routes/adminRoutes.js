@@ -27,13 +27,25 @@ router.post('/programmes', adminController.createProgramme);
 router.put('/programmes/:programmeId', adminController.updateProgramme);
 router.delete('/programmes/:programmeId', adminController.deleteProgramme);
 
+// Classes + Tracks
+router.get('/classes', adminController.getClasses);
+router.get('/tracks', adminController.getTracks);
+
+// Staff
+router.get('/staff', adminController.getStaff);
+router.get('/staff/:staffId/classes', adminController.getStaffClasses);
+router.post('/staff/:staffId/assign', adminController.assignStaffToClasses);
+
 // Payments
 router.get('/payments', adminController.getPayments);
 
 // Reports
 router.get('/reports', adminController.getReports);
 
-// Staff
-router.get('/staff', adminController.getStaff);
+// Blog / News  ← NEW
+router.get('/news', adminController.getNews);
+router.post('/news', adminController.createNews);
+router.put('/news/:newsId', adminController.updateNews);
+router.delete('/news/:newsId', adminController.deleteNews);
 
 module.exports = router;

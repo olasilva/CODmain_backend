@@ -1,12 +1,14 @@
+// src/app.js
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const fileUpload = require('express-fileupload');
-const session = require('express-session'); // ADD THIS
-const passport = require('./config/passport'); // ADD THIS
+const session = require('express-session');
+const passport = require('./config/passport');
 require('dotenv').config();
 
+// ─── Route imports ───
 const authRoutes = require('./routes/authRoutes');
 const studentRoutes = require('./routes/studentRoutes');
 const courseRoutes = require('./routes/courseRoutes');
@@ -22,10 +24,16 @@ const messageRoutes = require('./routes/messageRoutes');
 const notificationRoutes = require('./routes/notificationRoutes');
 const settingsRoutes = require('./routes/settingsRoutes');
 const reportRoutes = require('./routes/reportRoutes');
+const uploadRoutes = require('./routes/uploadRoutes');
 
 const app = express();
 
-// Security middleware
+// ═══════════════════════════════════════════════════════════════
+// 1. SECURITY + CORS
+// ═══════════════════════════════════════════════════════════════
+
+app.use(helmet());
+
 const allowedOrigins = [
   'http://localhost:3000',
   'http://localhost:5173',
@@ -33,48 +41,65 @@ const allowedOrigins = [
   process.env.FRONTEND_URL,
 ].filter(Boolean);
 
-app.use(cors({
-  origin: (origin, callback) => {
-    if (!origin) return callback(null, true);
-    if (allowedOrigins.includes(origin)) {
-      return callback(null, true);
-    }
-    console.warn('🚫 CORS blocked origin:', origin);
-    return callback(new Error(`Origin ${origin} not allowed by CORS`));
-  },
-  credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
-}));
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      if (!origin) return callback(null, true);
+      if (allowedOrigins.includes(origin)) return callback(null, true);
+      console.warn('🚫 CORS blocked origin:', origin);
+      return callback(new Error(`Origin ${origin} not allowed by CORS`));
+    },
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+  })
+);
 
-// Rate limiting
+// ═══════════════════════════════════════════════════════════════
+// 2. RATE LIMITING
+// ═══════════════════════════════════════════════════════════════
+
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 100
+  max: 300, // bumped from 100 — file uploads + polling need more
 });
 app.use('/api', limiter);
 
-// Body parsing
+// ═══════════════════════════════════════════════════════════════
+// 3. BODY PARSERS  ← MUST come before any route that reads req.body/req.files
+// ═══════════════════════════════════════════════════════════════
+
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
-app.use(fileUpload({
-  limits: { fileSize: 50 * 1024 * 1024 },
-  useTempFiles: true
-}));
+app.use(
+  fileUpload({
+    limits: { fileSize: 5 * 1024 * 1024 }, // 5 MB is fine for avatars
+    useTempFiles: false,                    // keep files in memory for buffers
+    createParentPath: true,
+    abortOnLimit: true,
+  })
+);
 
-// Session middleware (Required for Passport OAuth handshake)
-app.use(session({
-  secret: process.env.SESSION_SECRET || 'fallback_secret_for_dev',
-  resave: false,
-  saveUninitialized: false,
-  cookie: { secure: process.env.NODE_ENV === 'production' }
-}));
+// ═══════════════════════════════════════════════════════════════
+// 4. SESSION + PASSPORT
+// ═══════════════════════════════════════════════════════════════
 
-// Initialize Passport
+app.use(
+  session({
+    secret: process.env.SESSION_SECRET || 'fallback_secret_for_dev',
+    resave: false,
+    saveUninitialized: false,
+    cookie: { secure: process.env.NODE_ENV === 'production' },
+  })
+);
 app.use(passport.initialize());
 app.use(passport.session());
 
-// Routes
+// ═══════════════════════════════════════════════════════════════
+// 5. ROUTES  ← after all middleware
+// ═══════════════════════════════════════════════════════════════
+
+app.use('/api/upload', uploadRoutes);        // ← moved here (was too early)
 app.use('/api/auth', authRoutes);
 app.use('/api/student', studentRoutes);
 app.use('/api/courses', courseRoutes);
@@ -91,28 +116,33 @@ app.use('/api/notifications', notificationRoutes);
 app.use('/api/settings', settingsRoutes);
 app.use('/api/reports', reportRoutes);
 
-// Health check
+// ═══════════════════════════════════════════════════════════════
+// 6. HEALTH CHECK
+// ═══════════════════════════════════════════════════════════════
+
 app.get('/health', (req, res) => {
   res.json({
     status: 'OK',
     timestamp: new Date().toISOString(),
     environment: process.env.NODE_ENV || 'development',
-    version: '1.0.0'
+    version: '1.0.0',
   });
 });
 
-// Error handling middleware
+// ═══════════════════════════════════════════════════════════════
+// 7. ERROR HANDLERS
+// ═══════════════════════════════════════════════════════════════
+
 app.use((err, req, res, next) => {
   console.error('Error:', err);
   const status = err.status || 500;
   const message = err.message || 'Internal server error';
   res.status(status).json({
     error: message,
-    ...(process.env.NODE_ENV === 'development' && { stack: err.stack })
+    ...(process.env.NODE_ENV === 'development' && { stack: err.stack }),
   });
 });
 
-// 404 handler
 app.use((req, res) => {
   res.status(404).json({ error: 'Route not found' });
 });

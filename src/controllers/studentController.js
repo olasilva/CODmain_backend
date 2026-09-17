@@ -19,7 +19,6 @@ async function ensureStudent(req) {
   let student = await findStudent(userId);
   if (student) return student;
 
-  // Auto-create
   const { data: userRows } = await supabaseAdmin
     .from('users')
     .select('id, email, full_name')
@@ -29,14 +28,16 @@ async function ensureStudent(req) {
 
   const { data: created, error: createErr } = await supabaseAdmin
     .from('students')
-    .insert([{
-      user_id: userId,
-      student_id: `STU-${Date.now()}`,
-      full_name: user?.full_name || user?.email?.split('@')[0] || null,
-      email: user?.email || null,
-      status: 'active',
-      created_at: new Date().toISOString(),
-    }])
+    .insert([
+      {
+        user_id: userId,
+        student_id: `STU-${Date.now()}`,
+        full_name: user?.full_name || user?.email?.split('@')[0] || null,
+        email: user?.email || null,
+        status: 'active',
+        created_at: new Date().toISOString(),
+      },
+    ])
     .select()
     .single();
 
@@ -45,6 +46,86 @@ async function ensureStudent(req) {
     throw createErr;
   }
   return created;
+}
+
+// ============ MY PROGRAMME (from admission) ============
+async function getMyProgramme(req, res) {
+  try {
+    const userId = req.user?.id;
+    const student = await findStudent(userId);
+    if (!student) {
+      return res.json({ success: true, programme: null });
+    }
+
+    // Most recent admission = the programme they registered for
+    const { data: admRows, error } = await supabaseAdmin
+      .from('admissions')
+      .select('*')
+      .eq('student_id', student.id)
+      .order('created_at', { ascending: false })
+      .limit(1);
+    if (error) throw error;
+
+    const adm = admRows?.[0] || null;
+
+    if (!adm) {
+      return res.json({ success: true, programme: null });
+    }
+
+    res.json({
+      success: true,
+      programme: {
+        id: adm.id,
+        course: adm.course,
+        trackName: adm.track_name,
+        academicYear: adm.academic_year,
+        status: adm.status,
+        admissionNumber: adm.admission_number,
+        enrolledAt: adm.created_at,
+        description: [adm.course, adm.track_name].filter(Boolean).join(' · '),
+      },
+    });
+  } catch (error) {
+    console.error('❌ getMyProgramme error:', error.message);
+    res.status(500).json({
+      error: 'Failed to fetch your programme',
+      details: error.message,
+    });
+  }
+}
+
+// ============ MY CLASSES (assigned by staff) ============
+async function getMyEnrolledClasses(req, res) {
+  try {
+    const userId = req.user?.id;
+    const student = await findStudent(userId);
+    if (!student) return res.json({ success: true, classes: [] });
+
+    const { data: rows, error } = await supabaseAdmin
+      .from('student_classes')
+      .select(
+        `id, status, enrollment_date,
+         class:class_id (
+           id, title, subject, schedule,
+           instructor:instructor_id ( id, full_name, email, avatar_url )
+         )`
+      )
+      .eq('student_id', student.id)
+      .eq('status', 'active');
+    if (error) throw error;
+
+    const classes = (rows || [])
+      .map((r) => r.class)
+      .filter(Boolean);
+
+    res.json({ success: true, classes });
+  } catch (error) {
+    console.error('❌ getMyEnrolledClasses error:', error.message);
+    res.status(500).json({
+      error: 'Failed to fetch your classes',
+      details: error.message,
+    });
+  }
 }
 
 // ============ PROFILE ============
@@ -107,18 +188,11 @@ async function updateProfile(req, res) {
   }
 }
 
-// ============ COURSES ============
+// ============ COURSES (legacy — kept for compat) ============
 async function getCourses(req, res) {
   try {
-    const userId = req.user.id;
-    console.log('🔵 [getCourses] userId:', userId);
-
     const student = await ensureStudent(req);
-
-    if (!student?.id) {
-      console.warn('🟡 [getCourses] No student id — returning []');
-      return res.json([]);
-    }
+    if (!student?.id) return res.json([]);
 
     const { data, error } = await supabaseAdmin
       .from('enrollments')
@@ -129,8 +203,6 @@ async function getCourses(req, res) {
       console.warn('⚠️ [getCourses] enrollments query error:', error.message);
       return res.json([]);
     }
-
-    console.log(`🟢 [getCourses] Returning ${data?.length || 0} courses`);
     res.json(data || []);
   } catch (error) {
     console.error('❌ Get courses error:', error);
@@ -144,27 +216,15 @@ async function getCourseDetails(req, res) {
     const student = await ensureStudent(req);
     if (!student) return res.status(404).json({ error: 'Student record not found' });
 
-    const { data: enrollmentRows } = await supabaseAdmin
-      .from('enrollments')
-      .select('*')
-      .eq('student_id', student.id)
-      .eq('programme_id', courseId)
-      .limit(1);
-
-    if (!enrollmentRows || enrollmentRows.length === 0) {
-      return res.status(403).json({ error: 'Not enrolled in this course' });
-    }
-
     const { data: courseRows, error } = await supabaseAdmin
       .from('programmes')
       .select('*')
       .eq('id', courseId)
       .limit(1);
-
     if (error) throw error;
+
     const course = courseRows?.[0];
     if (!course) return res.status(404).json({ error: 'Course not found' });
-
     res.json(course);
   } catch (error) {
     console.error('Get course details error:', error);
@@ -180,11 +240,33 @@ async function getAssignments(req, res) {
 
     const { data: submissions } = await supabaseAdmin
       .from('submissions')
-      .select('*')
+      .select('*, assignment:assignment_id (*)')
       .eq('student_id', student.id)
       .order('created_at', { ascending: false });
 
-    res.json({ submitted: submissions || [], pending: [] });
+    // Pending: published assignments in any of student's classes not yet submitted
+    const { data: myClassRows } = await supabaseAdmin
+      .from('student_classes')
+      .select('class_id')
+      .eq('student_id', student.id)
+      .eq('status', 'active');
+
+    const myClassIds = (myClassRows || []).map((r) => r.class_id);
+
+    let pending = [];
+    if (myClassIds.length > 0) {
+      const { data: allAssignments } = await supabaseAdmin
+        .from('assignments')
+        .select('*, class:class_id ( id, title )')
+        .in('class_id', myClassIds)
+        .eq('is_published', true)
+        .order('due_date', { ascending: true });
+
+      const submittedIds = (submissions || []).map((s) => s.assignment_id);
+      pending = (allAssignments || []).filter((a) => !submittedIds.includes(a.id));
+    }
+
+    res.json({ submitted: submissions || [], pending });
   } catch (error) {
     console.error('Get assignments error:', error);
     res.status(500).json({ error: 'Failed to fetch assignments', details: error.message });
@@ -199,11 +281,11 @@ async function getAssignmentDetails(req, res) {
 
     const { data: assignmentRows, error } = await supabaseAdmin
       .from('assignments')
-      .select('*')
+      .select('*, class:class_id ( id, title )')
       .eq('id', assignmentId)
       .limit(1);
-
     if (error) throw error;
+
     const assignment = assignmentRows?.[0];
     if (!assignment) return res.status(404).json({ error: 'Assignment not found' });
 
@@ -240,9 +322,6 @@ async function submitAssignment(req, res) {
     if (assignment.is_published === false) {
       return res.status(400).json({ error: 'Assignment is not available' });
     }
-    if (assignment.due_date && new Date(assignment.due_date) < new Date()) {
-      return res.status(400).json({ error: 'Assignment is past due date' });
-    }
 
     const { data: existingRows } = await supabaseAdmin
       .from('submissions')
@@ -257,16 +336,19 @@ async function submitAssignment(req, res) {
 
     const { data: submission, error } = await supabaseAdmin
       .from('submissions')
-      .insert([{
-        assignment_id: assignmentId,
-        student_id: student.id,
-        content,
-        attachments: attachments || [],
-        status: 'submitted',
-      }])
+      .insert([
+        {
+          assignment_id: assignmentId,
+          student_id: student.id,
+          content,
+          attachments: attachments || [],
+          status: 'submitted',
+          submission_date: new Date().toISOString(),
+          created_at: new Date().toISOString(),
+        },
+      ])
       .select()
       .single();
-
     if (error) throw error;
 
     res.status(201).json({ message: 'Assignment submitted successfully', submission });
@@ -282,14 +364,27 @@ async function getClasses(req, res) {
     const student = await ensureStudent(req);
     if (!student) return res.status(404).json({ error: 'Student record not found' });
 
-    const { data: classes, error } = await supabaseAdmin
+    const { data: rows, error } = await supabaseAdmin
       .from('student_classes')
-      .select('*')
+      .select(
+        `id, status, enrollment_date,
+         class:class_id (
+           id, title, subject, schedule,
+           instructor:instructor_id ( id, full_name, email, avatar_url )
+         )`
+      )
       .eq('student_id', student.id)
       .eq('status', 'active');
-
     if (error) throw error;
-    res.json(classes || []);
+
+    const classes = (rows || []).map((r) => ({
+      id: r.id,
+      status: r.status,
+      enrollment_date: r.enrollment_date,
+      ...r.class,
+    }));
+
+    res.json(classes);
   } catch (error) {
     console.error('Get classes error:', error);
     res.status(500).json({ error: 'Failed to fetch classes', details: error.message });
@@ -304,7 +399,7 @@ async function getClassDetails(req, res) {
 
     const { data: enrollmentRows } = await supabaseAdmin
       .from('student_classes')
-      .select('*')
+      .select('id')
       .eq('student_id', student.id)
       .eq('class_id', classId)
       .eq('status', 'active')
@@ -316,14 +411,13 @@ async function getClassDetails(req, res) {
 
     const { data: classRows, error } = await supabaseAdmin
       .from('classes')
-      .select('*')
+      .select('*, instructor:instructor_id ( id, full_name, email, avatar_url )')
       .eq('id', classId)
       .limit(1);
-
     if (error) throw error;
+
     const classData = classRows?.[0];
     if (!classData) return res.status(404).json({ error: 'Class not found' });
-
     res.json(classData);
   } catch (error) {
     console.error('Get class details error:', error);
@@ -337,28 +431,45 @@ async function getResults(req, res) {
     const student = await ensureStudent(req);
     if (!student) return res.status(404).json({ error: 'Student record not found' });
 
+    // Prefer report_cards (new)
+    const { data: reportCards, error: rcErr } = await supabaseAdmin
+      .from('report_cards')
+      .select('*')
+      .eq('student_id', student.id)
+      .order('session', { ascending: false })
+      .order('term', { ascending: false });
+
+    if (!rcErr && reportCards && reportCards.length > 0) {
+      return res.json({
+        results: reportCards,
+        overall_gpa: null,
+        total_credits: 0,
+        source: 'report_cards',
+      });
+    }
+
+    // Fallback to legacy results table
     const { data: results, error } = await supabaseAdmin
       .from('results')
       .select('*')
       .eq('student_id', student.id);
-
     if (error) throw error;
 
     let totalCredits = 0;
     let totalPoints = 0;
-    results?.forEach((r) => {
+    (results || []).forEach((r) => {
       if (r.gpa && r.credits_earned) {
         totalCredits += r.credits_earned;
         totalPoints += r.gpa * r.credits_earned;
       }
     });
-
     const overallGPA = totalCredits > 0 ? (totalPoints / totalCredits).toFixed(2) : null;
 
     res.json({
       results: results || [],
       overall_gpa: overallGPA,
       total_credits: totalCredits,
+      source: 'results',
     });
   } catch (error) {
     console.error('Get results error:', error);
@@ -372,17 +483,25 @@ async function getResultDetails(req, res) {
     const student = await ensureStudent(req);
     if (!student) return res.status(404).json({ error: 'Student record not found' });
 
+    // Try report_cards first
+    const { data: rcRows } = await supabaseAdmin
+      .from('report_cards')
+      .select('*')
+      .eq('id', resultId)
+      .eq('student_id', student.id)
+      .limit(1);
+    if (rcRows?.[0]) return res.json(rcRows[0]);
+
     const { data: resultRows, error } = await supabaseAdmin
       .from('results')
       .select('*')
       .eq('id', resultId)
       .eq('student_id', student.id)
       .limit(1);
-
     if (error) throw error;
+
     const result = resultRows?.[0];
     if (!result) return res.status(404).json({ error: 'Result not found' });
-
     res.json(result);
   } catch (error) {
     console.error('Get result details error:', error);
@@ -401,13 +520,14 @@ async function getPayments(req, res) {
       .select('*')
       .eq('student_id', student.id)
       .order('created_at', { ascending: false });
-
     if (error) throw error;
 
-    const totalPaid = payments?.filter((p) => p.status === 'completed')
-      .reduce((s, p) => s + (p.amount || 0), 0) || 0;
-    const totalPending = payments?.filter((p) => p.status === 'pending')
-      .reduce((s, p) => s + (p.amount || 0), 0) || 0;
+    const totalPaid =
+      payments?.filter((p) => p.status === 'completed')
+        .reduce((s, p) => s + Number(p.amount || 0), 0) || 0;
+    const totalPending =
+      payments?.filter((p) => p.status === 'pending')
+        .reduce((s, p) => s + Number(p.amount || 0), 0) || 0;
 
     res.json({
       payments: payments || [],
@@ -435,11 +555,10 @@ async function getPaymentDetails(req, res) {
       .eq('id', paymentId)
       .eq('student_id', student.id)
       .limit(1);
-
     if (error) throw error;
+
     const payment = paymentRows?.[0];
     if (!payment) return res.status(404).json({ error: 'Payment not found' });
-
     res.json(payment);
   } catch (error) {
     console.error('Get payment details error:', error);
@@ -470,8 +589,8 @@ async function getMaterials(req, res) {
       .from('course_materials')
       .select('*')
       .eq('class_id', classId);
-
     if (error) throw error;
+
     res.json(materials || []);
   } catch (error) {
     console.error('Get materials error:', error);
@@ -503,11 +622,10 @@ async function getMaterial(req, res) {
       .eq('id', materialId)
       .eq('class_id', classId)
       .limit(1);
-
     if (error) throw error;
+
     const material = materialRows?.[0];
     if (!material) return res.status(404).json({ error: 'Material not found' });
-
     res.json(material);
   } catch (error) {
     console.error('Get material error:', error);
@@ -521,6 +639,8 @@ module.exports = {
   updateProfile,
   getCourses,
   getCourseDetails,
+  getMyProgramme,
+  getMyEnrolledClasses,
   getAssignments,
   getAssignmentDetails,
   submitAssignment,
