@@ -25,6 +25,7 @@ const notificationRoutes = require('./routes/notificationRoutes');
 const settingsRoutes = require('./routes/settingsRoutes');
 const reportRoutes = require('./routes/reportRoutes');
 const uploadRoutes = require('./routes/uploadRoutes');
+const sessionRoutes = require('./routes/sessionRoutes');   // ← added
 
 const app = express();
 
@@ -34,18 +35,41 @@ const app = express();
 
 app.use(helmet());
 
-const allowedOrigins = [
+// ─── Static origins (always allowed) ───
+const staticOrigins = [
   'http://localhost:3000',
   'http://localhost:5173',
   'http://127.0.0.1:5173',
-  process.env.FRONTEND_URL,
-].filter(Boolean);
+  'http://localhost:5174',
+  'https://co-dmain.vercel.app',
+];
+
+// ─── Extra origins from FRONTEND_URL (comma-separated) ───
+const envOrigins = (process.env.FRONTEND_URL || '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+const allowedOrigins = [...new Set([...staticOrigins, ...envOrigins])];
+
+// ─── Vercel preview URLs: co-dmain-<hash>.vercel.app ───
+const vercelPreviewRegex = /^https:\/\/co-dmain[a-z0-9-]*\.vercel\.app$/;
+
+// Log the allowlist once at boot so it's easy to verify
+console.log('🔓 CORS allowlist:', allowedOrigins);
 
 app.use(
   cors({
     origin: (origin, callback) => {
+      // Allow non-browser requests (curl, Postman, server-to-server)
       if (!origin) return callback(null, true);
+
+      // Direct match in allowlist
       if (allowedOrigins.includes(origin)) return callback(null, true);
+
+      // Vercel preview deploys
+      if (vercelPreviewRegex.test(origin)) return callback(null, true);
+
       console.warn('🚫 CORS blocked origin:', origin);
       return callback(new Error(`Origin ${origin} not allowed by CORS`));
     },
@@ -54,6 +78,9 @@ app.use(
     allowedHeaders: ['Content-Type', 'Authorization'],
   })
 );
+
+// Explicitly handle preflight requests
+app.options('*', cors());
 
 // ═══════════════════════════════════════════════════════════════
 // 2. RATE LIMITING
@@ -115,6 +142,11 @@ app.use('/api/messages', messageRoutes);
 app.use('/api/notifications', notificationRoutes);
 app.use('/api/settings', settingsRoutes);
 app.use('/api/reports', reportRoutes);
+
+// ─── Online sessions (staff + student) ───
+// Mounted at /api so the routes themselves control their prefix
+// (e.g. /api/staff/sessions, /api/student/sessions)
+app.use('/api', sessionRoutes);
 
 // ═══════════════════════════════════════════════════════════════
 // 6. HEALTH CHECK
