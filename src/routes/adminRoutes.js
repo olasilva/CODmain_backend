@@ -35,6 +35,7 @@ router.get('/tracks', adminController.getTracks);
 router.get('/staff', adminController.getStaff);
 router.get('/staff/:staffId/classes', adminController.getStaffClasses);
 router.post('/staff/:staffId/assign', adminController.assignStaffToClasses);
+router.post('/staff/:staffId/reset-password', adminController.resetStaffPassword);
 
 // Payments
 router.get('/payments', adminController.getPayments);
