@@ -2,6 +2,7 @@
 const express = require('express');
 const adminController = require('../controllers/adminController');
 const { authenticateToken, requireAdmin } = require('../middleware/auth');
+const contactController = require('../controllers/contactController');
 
 const router = express.Router();
 
@@ -12,6 +13,14 @@ router.use(authenticateToken, requireAdmin);
 // Dashboard
 // ═══════════════════════════════════════════════════════════════
 router.get('/stats', adminController.getStats);
+
+// ═══════════════════════════════════════════════════════════════
+// Contact inbox
+// ═══════════════════════════════════════════════════════════════
+router.get('/contact-messages', contactController.listMessages);
+router.put('/contact-messages/:id/read', contactController.markRead);
+router.post('/contact-messages/:id/reply', contactController.replyToMessage);
+router.delete('/contact-messages/:id', contactController.deleteMessage);
 
 // ═══════════════════════════════════════════════════════════════
 // Students

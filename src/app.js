@@ -25,7 +25,8 @@ const notificationRoutes = require('./routes/notificationRoutes');
 const settingsRoutes = require('./routes/settingsRoutes');
 const reportRoutes = require('./routes/reportRoutes');
 const uploadRoutes = require('./routes/uploadRoutes');
-const sessionRoutes = require('./routes/sessionRoutes');   // ← added
+const sessionRoutes = require('./routes/sessionRoutes');
+const contactRoutes = require('./routes/contactRoutes');   // ← NEW
 
 const app = express();
 
@@ -61,13 +62,8 @@ console.log('🔓 CORS allowlist:', allowedOrigins);
 app.use(
   cors({
     origin: (origin, callback) => {
-      // Allow non-browser requests (curl, Postman, server-to-server)
       if (!origin) return callback(null, true);
-
-      // Direct match in allowlist
       if (allowedOrigins.includes(origin)) return callback(null, true);
-
-      // Vercel preview deploys
       if (vercelPreviewRegex.test(origin)) return callback(null, true);
 
       console.warn('🚫 CORS blocked origin:', origin);
@@ -79,7 +75,6 @@ app.use(
   })
 );
 
-// Explicitly handle preflight requests
 app.options('*', cors());
 
 // ═══════════════════════════════════════════════════════════════
@@ -88,20 +83,20 @@ app.options('*', cors());
 
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 300, // bumped from 100 — file uploads + polling need more
+  max: 300,
 });
 app.use('/api', limiter);
 
 // ═══════════════════════════════════════════════════════════════
-// 3. BODY PARSERS  ← MUST come before any route that reads req.body/req.files
+// 3. BODY PARSERS
 // ═══════════════════════════════════════════════════════════════
 
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 app.use(
   fileUpload({
-    limits: { fileSize: 5 * 1024 * 1024 }, // 5 MB is fine for avatars
-    useTempFiles: false,                    // keep files in memory for buffers
+    limits: { fileSize: 5 * 1024 * 1024 },
+    useTempFiles: false,
     createParentPath: true,
     abortOnLimit: true,
   })
@@ -123,10 +118,10 @@ app.use(passport.initialize());
 app.use(passport.session());
 
 // ═══════════════════════════════════════════════════════════════
-// 5. ROUTES  ← after all middleware
+// 5. ROUTES
 // ═══════════════════════════════════════════════════════════════
 
-app.use('/api/upload', uploadRoutes);        // ← moved here (was too early)
+app.use('/api/upload', uploadRoutes);
 app.use('/api/auth', authRoutes);
 app.use('/api/student', studentRoutes);
 app.use('/api/courses', courseRoutes);
@@ -142,10 +137,9 @@ app.use('/api/messages', messageRoutes);
 app.use('/api/notifications', notificationRoutes);
 app.use('/api/settings', settingsRoutes);
 app.use('/api/reports', reportRoutes);
+app.use('/api/contact', contactRoutes);   // ← NEW
 
 // ─── Online sessions (staff + student) ───
-// Mounted at /api so the routes themselves control their prefix
-// (e.g. /api/staff/sessions, /api/student/sessions)
 app.use('/api', sessionRoutes);
 
 // ═══════════════════════════════════════════════════════════════
