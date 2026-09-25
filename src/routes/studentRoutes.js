@@ -15,6 +15,13 @@ router.put('/profile', authenticateToken, studentController.updateProfile);
 router.get('/my-programme', authenticateToken, studentController.getMyProgramme);
 router.get('/my-classes', authenticateToken, studentController.getMyEnrolledClasses);
 
+// ─── Attendance ───
+router.get('/attendance', authenticateToken, studentController.getMyAttendance);
+router.post('/attendance', authenticateToken, studentController.submitAttendance);
+
+// ─── Fees ───
+router.get('/fees', authenticateToken, studentController.getMyFees);
+
 // ─── Courses (legacy, kept for compat) ───
 router.get('/courses', authenticateToken, studentController.getCourses);
 router.get('/courses/:courseId', authenticateToken, studentController.getCourseDetails);
@@ -41,11 +48,13 @@ router.get('/notifications', authenticateToken, notificationController.getNotifi
 router.put('/notifications/:notificationId/read', authenticateToken, notificationController.markAsRead);
 router.put('/notifications/read-all', authenticateToken, notificationController.markAllAsRead);
 
-// ─── Messages ───
+// ─── Teacher messaging ───
+// NOTE: specific paths must come BEFORE the generic /messages
+router.get('/teachers', authenticateToken, studentController.getMyTeachers);
 router.get('/messages/unread-count', authenticateToken, messageController.getUnreadCount);
 router.put('/messages/:messageId/read', authenticateToken, messageController.markAsRead);
-router.get('/messages', authenticateToken, messageController.getMessages);
-router.post('/messages', authenticateToken, messageController.sendMessage);
+router.get('/messages/:teacherUserId', authenticateToken, studentController.getConversationWithTeacher);
+router.post('/messages', authenticateToken, studentController.sendMessageToTeacher);
 
 // ─── Settings ───
 router.get('/settings', authenticateToken, settingsController.getSettings);

@@ -28,9 +28,16 @@ class AdmissionController {
       const guardianPhone = personal.guardianPhone || body.guardianPhone;
       const homeAddress = personal.homeAddress || body.homeAddress;
       const medicalNotes = personal.medicalNotes || body.medicalNotes;
+      const experience = personal.experience || body.experience;
+      const comments = personal.comments || body.comments;
+
       const course = academic.course || body.course || body.campus || body.programme;
       const trackName = academic.trackName || body.trackName || body.track;
       const academicYear = body.academicYear || new Date().getFullYear().toString();
+
+      // NEW — from the merged application form
+      const regularClass = academic.regularClass || body.regularClass || null;
+      const instrument = academic.instrument || body.instrument || null;
 
       if (!course || !trackName) {
         return res.status(400).json({
@@ -46,6 +53,7 @@ class AdmissionController {
         });
       }
 
+      // Find or create student record
       let student = await supabaseAdmin
         .from('students')
         .select('id, user_id, student_id, full_name, status')
@@ -82,6 +90,7 @@ class AdmissionController {
         return res.status(500).json({ success: false, error: 'Student record could not be resolved' });
       }
 
+      // Check for duplicate application
       const { data: existing } = await supabaseAdmin
         .from('admissions')
         .select('*')
@@ -100,35 +109,91 @@ class AdmissionController {
 
       const admissionNumber = `ADM-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
 
-      const { data: admission, error: aErr } = await supabaseAdmin
+      // Build the payload — includes regular_class + instrument
+      const payload = {
+        student_id: student.id,
+        admission_number: admissionNumber,
+        student_name: studentName,
+        dob: dob || null,
+        gender: gender || null,
+        nationality: nationality || null,
+        previous_school: previousSchool || null,
+        guardian_name: guardianName,
+        guardian_email: guardianEmail,
+        guardian_phone: guardianPhone,
+        home_address: homeAddress,
+        medical_notes: medicalNotes || null,
+        course,
+        track_name: trackName,
+        academic_year: academicYear,
+        status: 'pending',
+        created_at: new Date().toISOString(),
+
+        // NEW fields from the merged application form
+        regular_class: regularClass,
+        instrument: instrument,
+      };
+
+      // Try full insert first — if columns don't exist, retry without them
+      let { data: admission, error: aErr } = await supabaseAdmin
         .from('admissions')
-        .insert([{
-          student_id: student.id,
-          admission_number: admissionNumber,
-          student_name: studentName,
-          dob: dob || null,
-          gender: gender || null,
-          nationality: nationality || null,
-          previous_school: previousSchool || null,
-          guardian_name: guardianName,
-          guardian_email: guardianEmail,
-          guardian_phone: guardianPhone,
-          home_address: homeAddress,
-          medical_notes: medicalNotes || null,
-          course,
-          track_name: trackName,
-          academic_year: academicYear,
-          status: 'pending',
-          created_at: new Date().toISOString(),
-        }])
+        .insert([payload])
         .select()
         .single();
-      if (aErr) throw aErr;
 
-      res.status(201).json({ success: true, message: 'Admission started successfully', admission });
+      if (aErr) {
+        // Fallback: if the new columns are missing, insert without them
+        console.warn('⚠️ Full insert failed →', aErr.message);
+        const minimalPayload = { ...payload };
+        delete minimalPayload.regular_class;
+        delete minimalPayload.instrument;
+
+        const retry = await supabaseAdmin
+          .from('admissions')
+          .insert([minimalPayload])
+          .select()
+          .single();
+
+        if (retry.error) {
+          console.error('❌ Minimal insert also failed →', retry.error.message);
+          throw retry.error;
+        }
+        admission = retry.data;
+      }
+
+      // Optionally log experience/comments to a notes field if you have one
+      if (experience || comments) {
+        try {
+          const noteText = [
+            experience ? `Experience: ${experience}` : null,
+            comments ? `Comments: ${comments}` : null,
+          ]
+            .filter(Boolean)
+            .join('\n\n');
+
+          if (noteText) {
+            await supabaseAdmin
+              .from('admissions')
+              .update({ notes: noteText, updated_at: new Date().toISOString() })
+              .eq('id', admission.id);
+          }
+        } catch (noteErr) {
+          console.warn('⚠️ Could not save notes:', noteErr.message);
+        }
+      }
+
+      res.status(201).json({
+        success: true,
+        message: 'Admission started successfully',
+        admission,
+      });
     } catch (error) {
       console.error('❌ startAdmission error:', error);
-      res.status(500).json({ success: false, error: 'Failed to start admission', details: error.message });
+      res.status(500).json({
+        success: false,
+        error: 'Failed to start admission',
+        details: error.message,
+      });
     }
   }
 
@@ -145,7 +210,11 @@ class AdmissionController {
         .order('created_at', { ascending: true })
         .limit(1);
       const student = sRows?.[0];
-      if (!student) return res.status(404).json({ success: false, error: 'Student record not found' });
+      if (!student) {
+        return res
+          .status(404)
+          .json({ success: false, error: 'Student record not found' });
+      }
 
       const { data: admissions, error } = await supabaseAdmin
         .from('admissions')
@@ -157,7 +226,11 @@ class AdmissionController {
       res.json({ success: true, admissions: admissions || [] });
     } catch (error) {
       console.error('❌ getAdmissionStatus error:', error.message);
-      res.status(500).json({ success: false, error: 'Failed to fetch admission status', details: error.message });
+      res.status(500).json({
+        success: false,
+        error: 'Failed to fetch admission status',
+        details: error.message,
+      });
     }
   }
 
@@ -169,33 +242,72 @@ class AdmissionController {
       const userId = req.user?.id;
       const { admissionId } = req.params;
       const { documents } = req.body;
-      if (!documents) return res.status(400).json({ success: false, error: 'Documents are required' });
+      if (!documents) {
+        return res
+          .status(400)
+          .json({ success: false, error: 'Documents are required' });
+      }
 
       const { data: sRows } = await supabaseAdmin
-        .from('students').select('id').eq('user_id', userId)
-        .order('created_at', { ascending: true }).limit(1);
+        .from('students')
+        .select('id')
+        .eq('user_id', userId)
+        .order('created_at', { ascending: true })
+        .limit(1);
       const student = sRows?.[0];
-      if (!student) return res.status(404).json({ success: false, error: 'Student record not found' });
+      if (!student) {
+        return res
+          .status(404)
+          .json({ success: false, error: 'Student record not found' });
+      }
 
       const { data: aRows } = await supabaseAdmin
-        .from('admissions').select('*').eq('id', admissionId).limit(1);
+        .from('admissions')
+        .select('*')
+        .eq('id', admissionId)
+        .limit(1);
       const admission = aRows?.[0];
-      if (!admission) return res.status(404).json({ success: false, error: 'Admission not found' });
-      if (admission.student_id !== student.id) return res.status(403).json({ success: false, error: 'Unauthorized' });
+      if (!admission) {
+        return res
+          .status(404)
+          .json({ success: false, error: 'Admission not found' });
+      }
+      if (admission.student_id !== student.id) {
+        return res.status(403).json({ success: false, error: 'Unauthorized' });
+      }
       if (!['pending', 'reviewing'].includes(admission.status)) {
-        return res.status(400).json({ success: false, error: 'Cannot submit documents at this stage' });
+        return res
+          .status(400)
+          .json({
+            success: false,
+            error: 'Cannot submit documents at this stage',
+          });
       }
 
       const { data: updated, error } = await supabaseAdmin
         .from('admissions')
-        .update({ documents, status: 'reviewing', updated_at: new Date().toISOString() })
-        .eq('id', admissionId).select().single();
+        .update({
+          documents,
+          status: 'reviewing',
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', admissionId)
+        .select()
+        .single();
       if (error) throw error;
 
-      res.json({ success: true, message: 'Documents submitted', admission: updated });
+      res.json({
+        success: true,
+        message: 'Documents submitted',
+        admission: updated,
+      });
     } catch (error) {
       console.error('❌ submitDocuments error:', error.message);
-      res.status(500).json({ success: false, error: 'Failed to submit documents', details: error.message });
+      res.status(500).json({
+        success: false,
+        error: 'Failed to submit documents',
+        details: error.message,
+      });
     }
   }
 
@@ -205,12 +317,19 @@ class AdmissionController {
   async getProgrammes(req, res) {
     try {
       const { data, error } = await supabaseAdmin
-        .from('programmes').select('*').eq('is_active', true).order('title');
+        .from('programmes')
+        .select('*')
+        .eq('is_active', true)
+        .order('title');
       if (error) throw error;
       res.json({ success: true, programmes: data || [] });
     } catch (error) {
       console.error('❌ getProgrammes error:', error.message);
-      res.status(500).json({ success: false, error: 'Failed to fetch programmes', details: error.message });
+      res.status(500).json({
+        success: false,
+        error: 'Failed to fetch programmes',
+        details: error.message,
+      });
     }
   }
 
@@ -221,13 +340,24 @@ class AdmissionController {
     try {
       const { programmeId } = req.params;
       const { data, error } = await supabaseAdmin
-        .from('programmes').select('*').eq('id', programmeId).limit(1);
+        .from('programmes')
+        .select('*')
+        .eq('id', programmeId)
+        .limit(1);
       if (error) throw error;
-      if (!data?.[0]) return res.status(404).json({ success: false, error: 'Programme not found' });
+      if (!data?.[0]) {
+        return res
+          .status(404)
+          .json({ success: false, error: 'Programme not found' });
+      }
       res.json({ success: true, programme: data[0] });
     } catch (error) {
       console.error('❌ getProgrammeById error:', error.message);
-      res.status(500).json({ success: false, error: 'Failed to fetch programme', details: error.message });
+      res.status(500).json({
+        success: false,
+        error: 'Failed to fetch programme',
+        details: error.message,
+      });
     }
   }
 }

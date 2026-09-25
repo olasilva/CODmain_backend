@@ -7,7 +7,9 @@ const { supabaseAdmin } = require('../config/supabase');
 async function getMyClasses(staffId) {
   const { data, error } = await supabaseAdmin
     .from('classes')
-    .select('id, title, subject, schedule, is_active, is_published, programme_id, instructor_id')
+    .select(
+      'id, title, subject, schedule, is_active, is_published, programme_id, instructor_id'
+    )
     .eq('instructor_id', staffId);
   if (error) {
     console.error('getMyClasses error:', error.message);
@@ -35,7 +37,9 @@ async function getMyStudents(staffId) {
 
   const { data: students, error: sErr } = await supabaseAdmin
     .from('students')
-    .select('id, user_id, student_id, full_name, status, academic_year, user:users ( id, email, phone, avatar_url )')
+    .select(
+      'id, user_id, student_id, full_name, status, academic_year, user:users ( id, email, phone, avatar_url )'
+    )
     .in('id', studentIds);
   if (sErr) {
     console.error('getMyStudents students error:', sErr.message);
@@ -75,7 +79,9 @@ async function getMe(req, res) {
   try {
     const { data } = await supabaseAdmin
       .from('users')
-      .select('id, full_name, email, phone, role, avatar_url, last_login, created_at')
+      .select(
+        'id, full_name, email, phone, role, avatar_url, last_login, created_at'
+      )
       .eq('id', req.user.id)
       .limit(1);
 
@@ -85,7 +91,9 @@ async function getMe(req, res) {
     res.json({ success: true, user: me, classes });
   } catch (err) {
     console.error('❌ staff getMe:', err.message);
-    res.status(500).json({ error: 'Failed to fetch profile', details: err.message });
+    res
+      .status(500)
+      .json({ error: 'Failed to fetch profile', details: err.message });
   }
 }
 
@@ -146,7 +154,9 @@ async function getStats(req, res) {
     });
   } catch (err) {
     console.error('❌ staff getStats:', err.message);
-    res.status(500).json({ error: 'Failed to fetch stats', details: err.message });
+    res
+      .status(500)
+      .json({ error: 'Failed to fetch stats', details: err.message });
   }
 }
 
@@ -170,7 +180,9 @@ async function getStudents(req, res) {
     res.json({ success: true, students });
   } catch (err) {
     console.error('❌ staff getStudents:', err.message);
-    res.status(500).json({ error: 'Failed to fetch students', details: err.message });
+    res
+      .status(500)
+      .json({ error: 'Failed to fetch students', details: err.message });
   }
 }
 
@@ -185,7 +197,9 @@ async function getStudentDetails(req, res) {
     const myStudents = await getMyStudents(staffId);
     const allowed = myStudents.find((s) => s.id === studentId);
     if (!allowed) {
-      return res.status(403).json({ error: 'This student is not in your classes' });
+      return res
+        .status(403)
+        .json({ error: 'This student is not in your classes' });
     }
 
     const { data: studentRows } = await supabaseAdmin
@@ -217,12 +231,264 @@ async function getStudentDetails(req, res) {
     });
   } catch (err) {
     console.error('❌ staff getStudentDetails:', err.message);
-    res.status(500).json({ error: 'Failed to fetch student', details: err.message });
+    res
+      .status(500)
+      .json({ error: 'Failed to fetch student', details: err.message });
   }
 }
 
 // ═══════════════════════════════════════════════════════════════
-// POST /api/staff/students/:studentId/scores
+// ATTENDANCE
+// ═══════════════════════════════════════════════════════════════
+
+// GET /api/staff/attendance/students?date=YYYY-MM-DD
+async function getAttendanceStudents(req, res) {
+  try {
+    const staffId = req.user.id;
+    const date = req.query.date || new Date().toISOString().slice(0, 10);
+
+    const [students, classes] = await Promise.all([
+      getMyStudents(staffId),
+      getMyClasses(staffId),
+    ]);
+
+    if (students.length === 0) {
+      return res.json({
+        success: true,
+        date,
+        students: [],
+        classes: classes.map((c) => ({
+          id: c.id,
+          title: c.title || c.subject || 'Class',
+        })),
+        message: 'You are not assigned to any classes yet.',
+      });
+    }
+
+    const ids = students.map((s) => s.id);
+    const { data: rows, error } = await supabaseAdmin
+      .from('attendance')
+      .select('student_id, status, notes')
+      .eq('date', date)
+      .in('student_id', ids);
+    if (error) throw error;
+
+    const attMap = {};
+    (rows || []).forEach((r) => {
+      attMap[r.student_id] = { status: r.status, notes: r.notes || '' };
+    });
+
+    const enriched = students.map((s) => ({
+      ...s,
+      attendance: attMap[s.id] || null,
+    }));
+
+    res.json({
+      success: true,
+      date,
+      students: enriched,
+      classes: classes.map((c) => ({
+        id: c.id,
+        title: c.title || c.subject || 'Class',
+      })),
+    });
+  } catch (err) {
+    console.error('❌ staff getAttendanceStudents:', err.message);
+    res.status(500).json({
+      error: 'Failed to fetch attendance students',
+      details: err.message,
+    });
+  }
+}
+
+// POST /api/staff/attendance
+async function markAttendance(req, res) {
+  try {
+    const staffId = req.user.id;
+    const { date, records } = req.body || {};
+
+    if (!date || !Array.isArray(records) || records.length === 0) {
+      return res
+        .status(400)
+        .json({ error: 'date and records[] are required' });
+    }
+
+    const myStudents = await getMyStudents(staffId);
+    const allowed = new Set(myStudents.map((s) => s.id));
+
+    const valid = records.filter(
+      (r) => r?.studentId && allowed.has(r.studentId)
+    );
+
+    if (valid.length === 0) {
+      return res.status(403).json({
+        error: 'None of the students in this list are assigned to you.',
+      });
+    }
+
+    const rows = valid.map((r) => ({
+      student_id: r.studentId,
+      date,
+      status: r.status || 'present',
+      course: r.course || null,
+      teacher: r.teacher || null,
+      notes: r.notes || null,
+      marked_by: staffId,
+      updated_at: new Date().toISOString(),
+    }));
+
+    const { data, error } = await supabaseAdmin
+      .from('attendance')
+      .upsert(rows, { onConflict: 'student_id,date,course' })
+      .select();
+
+    if (error) throw error;
+
+    res.json({
+      success: true,
+      marked: data?.length || 0,
+      skipped: records.length - valid.length,
+      records: data || [],
+    });
+  } catch (err) {
+    console.error('❌ staff markAttendance:', err.message);
+    res
+      .status(500)
+      .json({ error: 'Failed to mark attendance', details: err.message });
+  }
+}
+
+// GET /api/staff/attendance/history?days=30
+async function getAttendanceHistory(req, res) {
+  try {
+    const staffId = req.user.id;
+    const days = Math.min(180, Math.max(7, parseInt(req.query.days) || 30));
+
+    const students = await getMyStudents(staffId);
+    if (students.length === 0) {
+      return res.json({
+        success: true,
+        history: [],
+        byDate: {},
+        summary: null,
+      });
+    }
+
+    const studentIds = students.map((s) => s.id);
+    const since = new Date();
+    since.setDate(since.getDate() - days);
+
+    const { data, error } = await supabaseAdmin
+      .from('attendance')
+      .select('*')
+      .in('student_id', studentIds)
+      .gte('date', since.toISOString().slice(0, 10))
+      .order('date', { ascending: false });
+
+    if (error) throw error;
+
+    const list = data || [];
+    const summary = {
+      present: list.filter((r) => r.status === 'present').length,
+      absent: list.filter((r) => r.status === 'absent').length,
+      late: list.filter((r) => r.status === 'late').length,
+      excused: list.filter((r) => r.status === 'excused').length,
+      total: list.length,
+      studentCount: studentIds.length,
+    };
+    summary.rate =
+      summary.total > 0
+        ? Math.round(((summary.present + summary.late) / summary.total) * 100)
+        : 0;
+
+    const byDate = {};
+    list.forEach((r) => {
+      if (!byDate[r.date]) byDate[r.date] = [];
+      byDate[r.date].push(r);
+    });
+
+    res.json({ success: true, history: list, byDate, summary });
+  } catch (err) {
+    console.error('❌ staff getAttendanceHistory:', err.message);
+    res.status(500).json({
+      error: 'Failed to fetch attendance history',
+      details: err.message,
+    });
+  }
+}
+
+// GET /api/staff/attendance/submissions?date=YYYY-MM-DD
+async function getAttendanceSubmissions(req, res) {
+  try {
+    const staffId = req.user.id;
+    const { date } = req.query;
+
+    const students = await getMyStudents(staffId);
+    if (students.length === 0) {
+      return res.json({
+        success: true,
+        date: date || null,
+        submissions: [],
+        summary: null,
+      });
+    }
+
+    const studentIds = students.map((s) => s.id);
+
+    let query = supabaseAdmin
+      .from('attendance')
+      .select('*')
+      .in('student_id', studentIds)
+      .order('date', { ascending: false })
+      .order('created_at', { ascending: false });
+
+    if (date) query = query.eq('date', date);
+
+    const { data, error } = await query.limit(500);
+    if (error) throw error;
+
+    const studentMap = {};
+    students.forEach((s) => {
+      studentMap[s.id] = s;
+    });
+
+    const list = (data || []).map((r) => {
+      const s = studentMap[r.student_id] || {};
+      return {
+        ...r,
+        student_name: s.fullName || 'Unknown',
+        student_code: s.student_id || '',
+        student_email: s.email || '',
+        student_avatar: s.avatar_url || null,
+      };
+    });
+
+    const summary = {
+      total: list.length,
+      present: list.filter((r) => r.status === 'present').length,
+      late: list.filter((r) => r.status === 'late').length,
+      absent: list.filter((r) => r.status === 'absent').length,
+      excused: list.filter((r) => r.status === 'excused').length,
+      uniqueStudents: new Set(list.map((r) => r.student_id)).size,
+    };
+
+    res.json({
+      success: true,
+      date: date || null,
+      submissions: list,
+      summary,
+    });
+  } catch (err) {
+    console.error('❌ staff getAttendanceSubmissions:', err.message);
+    res.status(500).json({
+      error: 'Failed to fetch attendance submissions',
+      details: err.message,
+    });
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// SCORES / RESULTS
 // ═══════════════════════════════════════════════════════════════
 function computeGrade(total) {
   if (total >= 80) return { grade: 'A', remark: 'Distinction' };
@@ -240,7 +506,9 @@ async function submitScores(req, res) {
     const { session, term, subject, ca1, ca2, exam } = req.body;
 
     if (!session || !term || !subject) {
-      return res.status(400).json({ error: 'session, term, and subject are required' });
+      return res
+        .status(400)
+        .json({ error: 'session, term, and subject are required' });
     }
 
     const myStudents = await getMyStudents(staffId);
@@ -312,13 +580,12 @@ async function submitScores(req, res) {
     res.json({ success: true, reportCard: saved });
   } catch (err) {
     console.error('❌ staff submitScores:', err.message);
-    res.status(500).json({ error: 'Failed to save scores', details: err.message });
+    res
+      .status(500)
+      .json({ error: 'Failed to save scores', details: err.message });
   }
 }
 
-// ═══════════════════════════════════════════════════════════════
-// POST /api/staff/students/:studentId/submit-results
-// ═══════════════════════════════════════════════════════════════
 async function submitResults(req, res) {
   try {
     const { studentId } = req.params;
@@ -341,12 +608,14 @@ async function submitResults(req, res) {
     res.json({ success: true, reportCard: data });
   } catch (err) {
     console.error('❌ staff submitResults:', err.message);
-    res.status(500).json({ error: 'Failed to submit results', details: err.message });
+    res
+      .status(500)
+      .json({ error: 'Failed to submit results', details: err.message });
   }
 }
 
 // ═══════════════════════════════════════════════════════════════
-// GET /api/staff/assignments
+// ASSIGNMENTS
 // ═══════════════════════════════════════════════════════════════
 async function getAssignments(req, res) {
   try {
@@ -359,7 +628,9 @@ async function getAssignments(req, res) {
 
     const { data, error } = await supabaseAdmin
       .from('assignments')
-      .select('*, class:class_id ( id, title ), submissions:submissions ( id, student_id, status )')
+      .select(
+        '*, class:class_id ( id, title ), submissions:submissions ( id, student_id, status )'
+      )
       .in('class_id', classIds)
       .order('created_at', { ascending: false });
     if (error) {
@@ -370,26 +641,29 @@ async function getAssignments(req, res) {
     const assignments = (data || []).map((a) => ({
       ...a,
       submissionCount: a.submissions?.length || 0,
-      pendingCount: a.submissions?.filter((s) => s.status === 'submitted').length || 0,
+      pendingCount:
+        a.submissions?.filter((s) => s.status === 'submitted').length || 0,
     }));
 
     res.json({ success: true, assignments, classes });
   } catch (err) {
     console.error('❌ staff getAssignments:', err.message);
-    res.status(500).json({ error: 'Failed to fetch assignments', details: err.message });
+    res
+      .status(500)
+      .json({ error: 'Failed to fetch assignments', details: err.message });
   }
 }
 
-// ═══════════════════════════════════════════════════════════════
-// POST /api/staff/assignments
-// ═══════════════════════════════════════════════════════════════
 async function createAssignment(req, res) {
   try {
     const staffId = req.user.id;
-    const { class_id, title, description, due_date, subject, max_score } = req.body || {};
+    const { class_id, title, description, due_date, subject, max_score } =
+      req.body || {};
 
     if (!class_id || !title) {
-      return res.status(400).json({ error: 'class_id and title are required' });
+      return res
+        .status(400)
+        .json({ error: 'class_id and title are required' });
     }
 
     const { data: cls } = await supabaseAdmin
@@ -426,12 +700,14 @@ async function createAssignment(req, res) {
     res.status(201).json({ success: true, assignment: data });
   } catch (err) {
     console.error('❌ staff createAssignment:', err.message);
-    res.status(500).json({ error: 'Failed to create assignment', details: err.message });
+    res
+      .status(500)
+      .json({ error: 'Failed to create assignment', details: err.message });
   }
 }
 
 // ═══════════════════════════════════════════════════════════════
-// GET /api/staff/messages/:studentId
+// MESSAGES
 // ═══════════════════════════════════════════════════════════════
 async function getConversation(req, res) {
   try {
@@ -471,13 +747,12 @@ async function getConversation(req, res) {
     res.json({ success: true, messages: data || [] });
   } catch (err) {
     console.error('❌ staff getConversation:', err.message);
-    res.status(500).json({ error: 'Failed to fetch messages', details: err.message });
+    res
+      .status(500)
+      .json({ error: 'Failed to fetch messages', details: err.message });
   }
 }
 
-// ═══════════════════════════════════════════════════════════════
-// POST /api/staff/messages
-// ═══════════════════════════════════════════════════════════════
 async function sendMessage(req, res) {
   try {
     const staffId = req.user.id;
@@ -485,7 +760,9 @@ async function sendMessage(req, res) {
     const messageBody = (body || content || '').trim();
 
     if (!studentId || !messageBody) {
-      return res.status(400).json({ error: 'studentId and body are required' });
+      return res
+        .status(400)
+        .json({ error: 'studentId and body are required' });
     }
 
     const myStudents = await getMyStudents(staffId);
@@ -520,25 +797,29 @@ async function sendMessage(req, res) {
     res.status(201).json({ success: true, message: data });
   } catch (err) {
     console.error('❌ staff sendMessage:', err.message);
-    res.status(500).json({ error: 'Failed to send message', details: err.message });
+    res
+      .status(500)
+      .json({ error: 'Failed to send message', details: err.message });
   }
 }
 
-// ═══════════════════════════════════════════════════════════════
-// GET /api/staff/inbox
-// ═══════════════════════════════════════════════════════════════
 async function getInbox(req, res) {
   try {
     const staffId = req.user.id;
     const students = await getMyStudents(staffId);
     const studentUserIds = students.map((s) => s.user_id).filter(Boolean);
-    if (studentUserIds.length === 0) return res.json({ success: true, inbox: [] });
+    if (studentUserIds.length === 0)
+      return res.json({ success: true, inbox: [] });
 
     const { data, error } = await supabaseAdmin
       .from('messages')
       .select('*')
       .or(
-        `and(sender_id.eq.${staffId},recipient_id.in.(${studentUserIds.join(',')})),and(sender_id.in.(${studentUserIds.join(',')}),recipient_id.eq.${staffId})`
+        `and(sender_id.eq.${staffId},recipient_id.in.(${studentUserIds.join(
+          ','
+        )})),and(sender_id.in.(${studentUserIds.join(
+          ','
+        )}),recipient_id.eq.${staffId})`
       )
       .order('created_at', { ascending: false });
     if (error) throw error;
@@ -578,12 +859,14 @@ async function getInbox(req, res) {
     res.json({ success: true, inbox });
   } catch (err) {
     console.error('❌ staff getInbox:', err.message);
-    res.status(500).json({ error: 'Failed to fetch inbox', details: err.message });
+    res
+      .status(500)
+      .json({ error: 'Failed to fetch inbox', details: err.message });
   }
 }
 
 // ═══════════════════════════════════════════════════════════════
-// GET /api/staff/submissions/:assignmentId
+// SUBMISSIONS
 // ═══════════════════════════════════════════════════════════════
 async function getSubmissions(req, res) {
   try {
@@ -602,7 +885,9 @@ async function getSubmissions(req, res) {
 
     const { data, error } = await supabaseAdmin
       .from('submissions')
-      .select('*, student:student_id ( id, student_id, full_name, user:users ( email, avatar_url ) )')
+      .select(
+        '*, student:student_id ( id, student_id, full_name, user:users ( email, avatar_url ) )'
+      )
       .eq('assignment_id', assignmentId)
       .order('created_at', { ascending: false });
     if (error) throw error;
@@ -610,18 +895,24 @@ async function getSubmissions(req, res) {
     res.json({ success: true, assignment, submissions: data || [] });
   } catch (err) {
     console.error('❌ staff getSubmissions:', err.message);
-    res.status(500).json({ error: 'Failed to fetch submissions', details: err.message });
+    res
+      .status(500)
+      .json({ error: 'Failed to fetch submissions', details: err.message });
   }
 }
 
 // ═══════════════════════════════════════════════════════════════
-// EXPORTS — all 12 functions
+// EXPORTS — all functions
 // ═══════════════════════════════════════════════════════════════
 module.exports = {
   getMe,
   getStats,
   getStudents,
   getStudentDetails,
+  getAttendanceStudents,
+  markAttendance,
+  getAttendanceHistory,
+  getAttendanceSubmissions,
   submitScores,
   submitResults,
   getAssignments,

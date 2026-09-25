@@ -1,9 +1,6 @@
 // src/controllers/adminController.js
 const { supabaseAdmin } = require('../config/supabase');
 
-// Try to load bcrypt for password hashing (used by login).
-// If it's not installed, reset still saves the plaintext password for admin
-// viewing, but the password won't be usable for login until hashing works.
 let bcrypt = null;
 try {
   bcrypt = require('bcryptjs');
@@ -20,10 +17,6 @@ try {
 
 const BCRYPT_ROUNDS = 10;
 
-// ─────────────────────────────────────────────────────────────
-// Helper — generate a readable, reasonably strong temp password
-// Example output: "Tiger-River-4729!k"
-// ─────────────────────────────────────────────────────────────
 function generateTempPassword() {
   const words = [
     'Tiger', 'River', 'Lion', 'Eagle', 'Ocean', 'Sunset',
@@ -38,12 +31,99 @@ function generateTempPassword() {
   return `${pick()}-${pick()}-${num}${symbol}${suffix}`;
 }
 
+// ─────────────────────────────────────────────────────────────
+// Notify matching students when a teacher is assigned.
+// ─────────────────────────────────────────────────────────────
+async function notifyStudentsOfStaffAssignment({
+  staffId,          // ← NEW: needed for the deep-link
+  staffName,
+  category,
+  levels,
+}) {
+  if (!category) return 0;
+
+  const levelList = Array.isArray(levels) ? levels : [];
+
+  const { data: admissions, error } = await supabaseAdmin
+    .from('admissions')
+    .select('student_id, track_name, regular_class, instrument, created_at')
+    .order('created_at', { ascending: false });
+
+  if (error) {
+    console.error(
+      'notifyStudentsOfStaffAssignment: fetch failed',
+      error.message
+    );
+    return 0;
+  }
+
+  const latest = {};
+  (admissions || []).forEach((a) => {
+    if (!latest[a.student_id]) latest[a.student_id] = a;
+  });
+
+  const track = String(category).toLowerCase();
+  const matchedStudentIds = [];
+
+  Object.values(latest).forEach((a) => {
+    const studentTrack = String(a.track_name || '').toLowerCase();
+    const studentLevels = [a.regular_class, a.instrument].filter(Boolean);
+
+    if (track === 'regular' && !studentTrack.includes('regular')) return;
+    if (track === 'music' && !studentTrack.includes('music')) return;
+    if (
+      track === 'mixed' &&
+      !studentTrack.includes('mixed') &&
+      !studentTrack.includes('regular') &&
+      !studentTrack.includes('music')
+    )
+      return;
+
+    if (levelList.length > 0) {
+      const match = levelList.some((lvl) =>
+        studentLevels.some(
+          (sl) => String(sl).toLowerCase() === String(lvl).toLowerCase()
+        )
+      );
+      if (!match) return;
+    }
+
+    matchedStudentIds.push(a.student_id);
+  });
+
+  if (matchedStudentIds.length === 0) return 0;
+
+  const levelText =
+    levelList.length > 0 ? levelList.join(', ') : `${category} track`;
+
+  const notifications = matchedStudentIds.map((studentId) => ({
+    studentId,
+    title: `New teacher assigned: ${staffName}`,
+    message: `${staffName} has been assigned as your teacher for ${levelText}. You can now message them directly.`,
+    type: 'teacher_assigned',
+    link: staffId ? `/student/messages?teacher=${staffId}` : '/student/messages',  // ← CHANGED
+  }));
+
+  try {
+    const notificationController = require('./notificationController');
+    const { succeeded } = await notificationController.pushMany(
+      notifications
+    );
+    console.log(
+      `📢 Student notifications sent: ${succeeded}/${matchedStudentIds.length}`
+    );
+    return succeeded;
+  } catch (err) {
+    console.warn('Student notify failed:', err.message);
+    return 0;
+  }
+}
+
 class AdminController {
   // ═══════════════════════════════════════════════════════════
   // STUDENTS
   // ═══════════════════════════════════════════════════════════
 
-  // GET /api/admin/students
   async getStudents(req, res) {
     try {
       const page = parseInt(req.query.page) || 1;
@@ -192,7 +272,6 @@ class AdminController {
     }
   }
 
-  // GET /api/admin/students/:studentId
   async getStudentDetails(req, res) {
     try {
       const { studentId } = req.params;
@@ -262,7 +341,6 @@ class AdminController {
     }
   }
 
-  // PUT /api/admin/students/:studentId
   async updateStudent(req, res) {
     try {
       const { studentId } = req.params;
@@ -314,7 +392,6 @@ class AdminController {
     }
   }
 
-  // DELETE /api/admin/students/:studentId
   async deleteStudent(req, res) {
     try {
       const { studentId } = req.params;
@@ -347,7 +424,6 @@ class AdminController {
   // PROGRAMMES
   // ═══════════════════════════════════════════════════════════
 
-  // GET /api/admin/programmes
   async getProgrammes(req, res) {
     try {
       const { data, error } = await supabaseAdmin
@@ -365,7 +441,6 @@ class AdminController {
     }
   }
 
-  // POST /api/admin/programmes
   async createProgramme(req, res) {
     try {
       const { title, name, description, is_active } = req.body;
@@ -398,7 +473,6 @@ class AdminController {
     }
   }
 
-  // PUT /api/admin/programmes/:programmeId
   async updateProgramme(req, res) {
     try {
       const { programmeId } = req.params;
@@ -423,7 +497,6 @@ class AdminController {
     }
   }
 
-  // DELETE /api/admin/programmes/:programmeId
   async deleteProgramme(req, res) {
     try {
       const { programmeId } = req.params;
@@ -446,7 +519,6 @@ class AdminController {
   // STATS & REPORTS
   // ═══════════════════════════════════════════════════════════
 
-  // GET /api/admin/stats
   async getStats(req, res) {
     try {
       const [
@@ -514,7 +586,6 @@ class AdminController {
     }
   }
 
-  // GET /api/admin/payments
   async getPayments(req, res) {
     try {
       const { status, studentId } = req.query;
@@ -563,7 +634,6 @@ class AdminController {
     }
   }
 
-  // GET /api/admin/reports
   async getReports(req, res) {
     try {
       const [studentsRes, paymentsRes, admissionsRes] = await Promise.all([
@@ -654,7 +724,6 @@ class AdminController {
   // REPORT CARDS
   // ═══════════════════════════════════════════════════════════
 
-  // GET /api/admin/students/:studentId/report-cards
   async getStudentReportCards(req, res) {
     try {
       const { studentId } = req.params;
@@ -684,7 +753,6 @@ class AdminController {
     }
   }
 
-  // GET /api/admin/students/:studentId/report-cards/:session/:term
   async getReportCard(req, res) {
     try {
       const { studentId, session, term } = req.params;
@@ -719,7 +787,6 @@ class AdminController {
     }
   }
 
-  // POST /api/admin/students/:studentId/report-cards
   async upsertReportCard(req, res) {
     try {
       const { studentId } = req.params;
@@ -756,7 +823,6 @@ class AdminController {
   // STAFF
   // ═══════════════════════════════════════════════════════════
 
-  // GET /api/admin/staff
   async getStaff(req, res) {
     try {
       const { search } = req.query;
@@ -764,7 +830,7 @@ class AdminController {
       const { data, error, count } = await supabaseAdmin
         .from('users')
         .select(
-          'id, full_name, email, phone, role, is_active, last_login, created_at, avatar_url, department',
+          'id, full_name, email, phone, role, is_active, last_login, created_at, avatar_url, department, staff_category, staff_levels',
           { count: 'exact' }
         )
         .in('role', ['staff', 'admin'])
@@ -797,8 +863,6 @@ class AdminController {
     }
   }
 
-  // GET /api/admin/staff/:staffId
-  // Full details for one staff member
   async getStaffDetails(req, res) {
     try {
       const { staffId } = req.params;
@@ -808,7 +872,8 @@ class AdminController {
         .select(
           `id, full_name, email, phone, role, is_active,
            last_login, created_at, updated_at, avatar_url,
-           department, temporary_password, temp_password_set_at`
+           department, temporary_password, temp_password_set_at,
+           staff_category, staff_levels`
         )
         .eq('id', staffId)
         .single();
@@ -845,8 +910,6 @@ class AdminController {
     }
   }
 
-  // GET /api/admin/staff/:staffId/password
-  // Returns the last-issued temporary password (set at account creation).
   async getStaffPassword(req, res) {
     try {
       const { staffId } = req.params;
@@ -888,15 +951,11 @@ class AdminController {
     }
   }
 
-  // POST /api/admin/staff/:staffId/reset-password
-  // Generates a new temporary password, saves it on the user,
-  // hashes it for login, and optionally emails it.
   async resetStaffPassword(req, res) {
     try {
       const { staffId } = req.params;
       const { sendEmail = true } = req.body || {};
 
-      // Confirm staff exists
       const { data: user, error: fetchErr } = await supabaseAdmin
         .from('users')
         .select('id, full_name, email, role')
@@ -915,7 +974,6 @@ class AdminController {
 
       const tempPassword = generateTempPassword();
 
-      // Hash the password so it can actually be used for login.
       let passwordHash = null;
       if (bcrypt) {
         try {
@@ -945,7 +1003,6 @@ class AdminController {
 
       if (updateErr) throw updateErr;
 
-      // Email the new password (best-effort)
       let emailed = false;
       if (sendEmail && user.email) {
         try {
@@ -1000,12 +1057,28 @@ class AdminController {
     }
   }
 
-  // PUT /api/admin/staff/:staffId
-  // Update staff name, phone, department, role, active flag
   async updateStaff(req, res) {
     try {
       const { staffId } = req.params;
-      const { fullName, phone, department, role, is_active } = req.body;
+      const {
+        fullName,
+        phone,
+        department,
+        role,
+        is_active,
+        staff_category,
+        staff_levels,
+      } = req.body;
+
+      const { data: current, error: fetchErr } = await supabaseAdmin
+        .from('users')
+        .select('id, full_name, email, staff_category, staff_levels')
+        .eq('id', staffId)
+        .single();
+
+      if (fetchErr || !current) {
+        return res.status(404).json({ error: 'Staff not found' });
+      }
 
       const updates = { updated_at: new Date().toISOString() };
 
@@ -1026,21 +1099,62 @@ class AdminController {
       }
       if (is_active !== undefined) updates.is_active = !!is_active;
 
+      let categoryChanged = false;
+
+      if (staff_category !== undefined) {
+        const allowed = ['regular', 'music', 'mixed', null, ''];
+        const newCat = allowed.includes(staff_category)
+          ? staff_category || null
+          : null;
+        updates.staff_category = newCat;
+        if (current.staff_category !== newCat) categoryChanged = true;
+      }
+
+      if (staff_levels !== undefined) {
+        const newLevels = Array.isArray(staff_levels) ? staff_levels : [];
+        updates.staff_levels = newLevels;
+
+        const oldLevels = Array.isArray(current.staff_levels)
+          ? [...current.staff_levels].sort()
+          : [];
+        const sorted = [...newLevels].sort();
+        if (JSON.stringify(oldLevels) !== JSON.stringify(sorted)) {
+          categoryChanged = true;
+        }
+      }
+
       const { data, error } = await supabaseAdmin
         .from('users')
         .update(updates)
         .eq('id', staffId)
         .select(
-          'id, full_name, email, phone, role, is_active, department, avatar_url, last_login, created_at'
+          'id, full_name, email, phone, role, is_active, department, avatar_url, last_login, created_at, staff_category, staff_levels'
         )
         .single();
 
       if (error) throw error;
 
+      let notified = 0;
+      const finalCategory = updates.staff_category ?? current.staff_category;
+      if (categoryChanged && finalCategory) {
+        const finalLevels =
+          updates.staff_levels ?? current.staff_levels ?? [];
+        const staffName =
+          updates.full_name || current.full_name || 'Your teacher';
+
+        notified = await notifyStudentsOfStaffAssignment({
+          staffId,        // ← CHANGED: pass staffId so the deep-link works
+          staffName,
+          category: finalCategory,
+          levels: finalLevels,
+        });
+      }
+
       return res.json({
         success: true,
         message: 'Staff updated successfully',
         staff: data,
+        notified,
       });
     } catch (error) {
       console.error('❌ Update staff error:', error.message);
@@ -1051,13 +1165,10 @@ class AdminController {
     }
   }
 
-  // DELETE /api/admin/staff/:staffId
-  // Removes the user. Also unassigns them from any classes.
   async deleteStaff(req, res) {
     try {
       const { staffId } = req.params;
 
-      // Safety: don't let an admin delete themselves
       const callerId =
         req.user?.id || req.user?._id || req.user?.userId;
       if (callerId && String(callerId) === String(staffId)) {
@@ -1066,7 +1177,6 @@ class AdminController {
         });
       }
 
-      // Confirm exists + prevent deleting a student
       const { data: user, error: fetchErr } = await supabaseAdmin
         .from('users')
         .select('id, role, email')
@@ -1083,7 +1193,6 @@ class AdminController {
         });
       }
 
-      // Unassign from all classes first (keeps FK happy)
       await supabaseAdmin
         .from('classes')
         .update({
@@ -1092,7 +1201,6 @@ class AdminController {
         })
         .eq('instructor_id', staffId);
 
-      // Delete the user row
       const { error: deleteErr } = await supabaseAdmin
         .from('users')
         .delete()
@@ -1117,7 +1225,6 @@ class AdminController {
   // CLASSES
   // ═══════════════════════════════════════════════════════════
 
-  // GET /api/admin/classes
   async getClasses(req, res) {
     try {
       const { data, error } = await supabaseAdmin
@@ -1139,7 +1246,6 @@ class AdminController {
     }
   }
 
-  // GET /api/admin/tracks
   async getTracks(req, res) {
     try {
       const { data, error } = await supabaseAdmin
@@ -1169,7 +1275,6 @@ class AdminController {
     }
   }
 
-  // GET /api/admin/staff/:staffId/classes
   async getStaffClasses(req, res) {
     try {
       const { staffId } = req.params;
@@ -1189,7 +1294,6 @@ class AdminController {
     }
   }
 
-  // POST /api/admin/staff/:staffId/assign
   async assignStaffToClasses(req, res) {
     try {
       const { staffId } = req.params;
@@ -1199,14 +1303,12 @@ class AdminController {
         return res.status(400).json({ error: 'classIds must be an array' });
       }
 
-      // Clear current assignments
       const { error: unassignErr } = await supabaseAdmin
         .from('classes')
         .update({ instructor_id: null, updated_at: new Date().toISOString() })
         .eq('instructor_id', staffId);
       if (unassignErr) throw unassignErr;
 
-      // Apply new assignments
       if (classIds.length > 0) {
         const { error: assignErr } = await supabaseAdmin
           .from('classes')
@@ -1242,7 +1344,6 @@ class AdminController {
   // NEWS / BLOG
   // ═══════════════════════════════════════════════════════════
 
-  // GET /api/admin/news
   async getNews(req, res) {
     try {
       const { data, error } = await supabaseAdmin
@@ -1260,7 +1361,6 @@ class AdminController {
     }
   }
 
-  // POST /api/admin/news
   async createNews(req, res) {
     try {
       const {
@@ -1358,7 +1458,6 @@ class AdminController {
     }
   }
 
-  // PUT /api/admin/news/:newsId
   async updateNews(req, res) {
     try {
       const { newsId } = req.params;
@@ -1415,7 +1514,6 @@ class AdminController {
     }
   }
 
-  // DELETE /api/admin/news/:newsId
   async deleteNews(req, res) {
     try {
       const { newsId } = req.params;

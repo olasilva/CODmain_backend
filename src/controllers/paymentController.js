@@ -5,7 +5,22 @@ const { supabaseAdmin } = require('../config/supabase');
 
 const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
 const PAYSTACK_BASE = 'https://api.paystack.co';
-const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
+
+// Handles "url1,url2" in FRONTEND_URL — use the first one as the canonical frontend
+const FRONTEND_URL =
+  (process.env.FRONTEND_URL || 'http://localhost:5173').split(',')[0].trim();
+
+// Backend URL is used so Paystack redirects to us first, then we forward to frontend.
+// Set BACKEND_URL in .env for production. Falls back to the incoming request's host.
+function resolveBackendUrl(req) {
+  if (process.env.BACKEND_URL) {
+    return process.env.BACKEND_URL.replace(/\/$/, '');
+  }
+  // Derive from the current request (works in dev + on Vercel)
+  const proto = req.headers['x-forwarded-proto'] || req.protocol || 'http';
+  const host = req.headers['x-forwarded-host'] || req.get('host');
+  return `${proto}://${host}`;
+}
 
 // ============================================================
 // Helpers
@@ -66,7 +81,14 @@ async function initializePayment(req, res) {
       return res.status(401).json({ error: 'Authentication required' });
     }
 
-    const { amount, email, course, trackName, plan, studentName } = req.body;
+    const {
+      amount,
+      email,
+      course,
+      trackName,
+      plan,
+      studentName,
+    } = req.body;
 
     if (!amount || !email) {
       return res.status(400).json({ error: 'Amount and email are required' });
@@ -79,12 +101,16 @@ async function initializePayment(req, res) {
 
     const student = await ensureStudent(userId, studentName);
 
+    // ── Callback URL must be the BACKEND verify endpoint ──
+    // Paystack will append ?reference=xxx automatically.
+    // After verifying, our verifyPayment() redirects the browser to the frontend.
+    const backendUrl = resolveBackendUrl(req);
+    const callbackUrl = `${backendUrl}/api/payments/verify`;
+
     const params = {
       email,
       amount: amountInKobo,
-      callback_url:
-        process.env.PAYSTACK_CALLBACK_URL ||
-        `${FRONTEND_URL}/payment/callback`,
+      callback_url: callbackUrl,
       metadata: {
         userId,
         studentDbId: student.id,
@@ -128,6 +154,7 @@ async function initializePayment(req, res) {
     const { authorization_url, access_code, reference } = response.data.data;
 
     const paymentId = `PAY-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+
     const { data: payment, error: insertErr } = await supabaseAdmin
       .from('payments')
       .insert([{
@@ -137,7 +164,7 @@ async function initializePayment(req, res) {
         amount: Number(amount),
         currency: 'NGN',
         plan: plan || 'termly',
-        payment_type: plan || 'termly',
+        payment_type: 'school_fees',
         description: [course, trackName].filter(Boolean).join(' · ') || null,
         status: 'pending',
         created_at: new Date().toISOString(),
@@ -169,12 +196,14 @@ async function initializePayment(req, res) {
 
 // ============================================================
 // GET /api/payments/verify?reference=xxx
+// Paystack redirects the browser here after a payment.
+// We verify with Paystack, update our DB, then redirect to the frontend.
 // ============================================================
 async function verifyPayment(req, res) {
   try {
     const { reference } = req.query;
     if (!reference) {
-      return res.status(400).json({ error: 'Reference is required' });
+      return res.redirect(`${FRONTEND_URL}/login?error=missing_reference`);
     }
 
     const response = await axios.get(
@@ -186,7 +215,9 @@ async function verifyPayment(req, res) {
 
     const payload = response.data;
     if (!payload?.status || !payload?.data) {
-      return res.status(400).json({ error: 'Verification failed' });
+      return res.redirect(
+        `${FRONTEND_URL}/login?error=verification_failed&reference=${encodeURIComponent(reference)}`
+      );
     }
 
     const data = payload.data;
@@ -214,15 +245,18 @@ async function verifyPayment(req, res) {
       }
     }
 
+    // ── Send the browser back to the frontend
     const redirectPath = isSuccessful
-      ? `/admission/submitted?reference=${reference}`
-      : `/payment/failed?reference=${reference}`;
+      ? `/login?registered=true&reference=${encodeURIComponent(reference)}`
+      : `/payment/failed?reference=${encodeURIComponent(reference)}`;
 
     return res.redirect(`${FRONTEND_URL}${redirectPath}`);
   } catch (error) {
     const detail = error.response?.data?.message || error.message;
     console.error('❌ verifyPayment error:', detail);
-    return res.redirect(`${FRONTEND_URL}/payment/failed`);
+    return res.redirect(
+      `${FRONTEND_URL}/login?error=verification_error&reference=${encodeURIComponent(req.query.reference || '')}`
+    );
   }
 }
 
