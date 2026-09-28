@@ -18,58 +18,166 @@ async function getMyClasses(staffId) {
   return data || [];
 }
 
-async function getMyStudents(staffId) {
-  const classes = await getMyClasses(staffId);
-  const classIds = classes.map((c) => c.id);
-  if (classIds.length === 0) return [];
-
-  const { data: enrolls, error } = await supabaseAdmin
-    .from('student_classes')
-    .select('class_id, student_id, status')
-    .in('class_id', classIds);
+async function getStaffProfile(staffId) {
+  const { data, error } = await supabaseAdmin
+    .from('users')
+    .select('id, staff_category, staff_levels')
+    .eq('id', staffId)
+    .limit(1);
   if (error) {
-    console.error('getMyStudents enrolls error:', error.message);
-    return [];
+    console.error('getStaffProfile error:', error.message);
+    return null;
+  }
+  return data?.[0] || null;
+}
+
+function admissionMatchesStaff(admission, staffCat, staffLevels) {
+  const norm = (s) => String(s || '').toLowerCase().trim();
+
+  const cat = norm(staffCat);
+  const levels = Array.isArray(staffLevels)
+    ? staffLevels.map(norm).filter(Boolean)
+    : [];
+
+  if (cat && cat !== 'mixed') {
+    const track = norm(admission?.track_name || admission?.course);
+    if (track) {
+      if (cat.includes('regular') || cat.includes('academ')) {
+        if (
+          track.includes('music') &&
+          !track.includes('regular') &&
+          !track.includes('mixed')
+        ) {
+          return false;
+        }
+      } else if (cat.includes('music')) {
+        if (
+          track.includes('regular') &&
+          !track.includes('music') &&
+          !track.includes('mixed')
+        ) {
+          return false;
+        }
+      }
+    }
   }
 
-  const studentIds = [...new Set((enrolls || []).map((e) => e.student_id))];
-  if (studentIds.length === 0) return [];
+  if (levels.length > 0) {
+    const level = norm(admission?.regular_class || admission?.instrument);
+    if (level) {
+      const match = levels.some(
+        (l) => level === l || level.includes(l) || l.includes(level)
+      );
+      if (!match) return false;
+    }
+  }
 
-  const { data: students, error: sErr } = await supabaseAdmin
+  return true;
+}
+
+async function getMyStudents(staffId) {
+  const [classes, staffProfile] = await Promise.all([
+    getMyClasses(staffId),
+    getStaffProfile(staffId),
+  ]);
+
+  const staffCat = staffProfile?.staff_category || null;
+  const staffLevels = Array.isArray(staffProfile?.staff_levels)
+    ? staffProfile.staff_levels
+    : [];
+
+  const classIds = classes.map((c) => c.id);
+  const enrolledIds = new Set();
+  const byClass = {};
+
+  if (classIds.length > 0) {
+    const { data: enrolls, error } = await supabaseAdmin
+      .from('student_classes')
+      .select('class_id, student_id, status')
+      .in('class_id', classIds);
+    if (error) {
+      console.error('getMyStudents enrolls error:', error.message);
+    } else {
+      (enrolls || []).forEach((e) => {
+        enrolledIds.add(e.student_id);
+        byClass[e.student_id] = byClass[e.student_id] || [];
+        const cls = classes.find((c) => c.id === e.class_id);
+        if (cls) {
+          byClass[e.student_id].push({
+            id: cls.id,
+            title: cls.title || cls.subject || 'Class',
+          });
+        }
+      });
+    }
+  }
+
+  const { data: allStudents, error: sErr } = await supabaseAdmin
     .from('students')
     .select(
       'id, user_id, student_id, full_name, status, academic_year, user:users ( id, email, phone, avatar_url )'
     )
-    .in('id', studentIds);
+    .eq('status', 'active');
   if (sErr) {
     console.error('getMyStudents students error:', sErr.message);
     return [];
   }
 
-  const byClass = {};
-  (enrolls || []).forEach((e) => {
-    byClass[e.student_id] = byClass[e.student_id] || [];
-    const cls = classes.find((c) => c.id === e.class_id);
-    if (cls) {
-      byClass[e.student_id].push({
-        id: cls.id,
-        title: cls.title || cls.subject || 'Class',
+  const studentIds = (allStudents || []).map((s) => s.id);
+  const admByStudent = {};
+
+  if (studentIds.length > 0) {
+    const { data: admRows, error: admErr } = await supabaseAdmin
+      .from('admissions')
+      .select(
+        'student_id, track_name, regular_class, instrument, course, created_at'
+      )
+      .in('student_id', studentIds)
+      .order('created_at', { ascending: false });
+    if (admErr) {
+      console.error('getMyStudents admissions error:', admErr.message);
+    } else {
+      (admRows || []).forEach((a) => {
+        if (!admByStudent[a.student_id]) admByStudent[a.student_id] = a;
       });
     }
+  }
+
+  const seen = new Set();
+  const result = [];
+  const hasCategoryFilter = Boolean(staffCat) || staffLevels.length > 0;
+
+  (allStudents || []).forEach((s) => {
+    const admission = admByStudent[s.id] || null;
+    const isEnrolledInMyClass = enrolledIds.has(s.id);
+
+    let include = isEnrolledInMyClass;
+
+    if (!include && hasCategoryFilter) {
+      include = admissionMatchesStaff(admission, staffCat, staffLevels);
+    }
+
+    if (!include || seen.has(s.id)) return;
+    seen.add(s.id);
+
+    result.push({
+      id: s.id,
+      user_id: s.user_id,
+      student_id: s.student_id,
+      fullName: s.full_name,
+      email: s.user?.email || null,
+      phone: s.user?.phone || null,
+      avatar_url: s.user?.avatar_url || null,
+      status: s.status,
+      academic_year: s.academic_year,
+      track_name: admission?.track_name || null,
+      regular_class: admission?.regular_class || null,
+      instrument: admission?.instrument || null,
+      classes: byClass[s.id] || [],
+    });
   });
 
-  return (students || []).map((s) => ({
-    id: s.id,
-    user_id: s.user_id,
-    student_id: s.student_id,
-    fullName: s.full_name,
-    email: s.user?.email || null,
-    phone: s.user?.phone || null,
-    avatar_url: s.user?.avatar_url || null,
-    status: s.status,
-    academic_year: s.academic_year,
-    classes: byClass[s.id] || [],
-  }));
+  return result;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -80,7 +188,7 @@ async function getMe(req, res) {
     const { data } = await supabaseAdmin
       .from('users')
       .select(
-        'id, full_name, email, phone, role, avatar_url, last_login, created_at'
+        'id, full_name, email, phone, role, avatar_url, last_login, created_at, staff_category, staff_levels'
       )
       .eq('id', req.user.id)
       .limit(1);
@@ -241,7 +349,6 @@ async function getStudentDetails(req, res) {
 // ATTENDANCE
 // ═══════════════════════════════════════════════════════════════
 
-// GET /api/staff/attendance/students?date=YYYY-MM-DD
 async function getAttendanceStudents(req, res) {
   try {
     const staffId = req.user.id;
@@ -261,7 +368,7 @@ async function getAttendanceStudents(req, res) {
           id: c.id,
           title: c.title || c.subject || 'Class',
         })),
-        message: 'You are not assigned to any classes yet.',
+        message: 'No students match your category or classes yet.',
       });
     }
 
@@ -301,7 +408,6 @@ async function getAttendanceStudents(req, res) {
   }
 }
 
-// POST /api/staff/attendance
 async function markAttendance(req, res) {
   try {
     const staffId = req.user.id;
@@ -334,6 +440,9 @@ async function markAttendance(req, res) {
       teacher: r.teacher || null,
       notes: r.notes || null,
       marked_by: staffId,
+      approval_status: 'approved',
+      approved_by: staffId,
+      approved_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
     }));
 
@@ -358,7 +467,6 @@ async function markAttendance(req, res) {
   }
 }
 
-// GET /api/staff/attendance/history?days=30
 async function getAttendanceHistory(req, res) {
   try {
     const staffId = req.user.id;
@@ -417,7 +525,6 @@ async function getAttendanceHistory(req, res) {
   }
 }
 
-// GET /api/staff/attendance/submissions?date=YYYY-MM-DD
 async function getAttendanceSubmissions(req, res) {
   try {
     const staffId = req.user.id;
@@ -460,6 +567,9 @@ async function getAttendanceSubmissions(req, res) {
         student_code: s.student_id || '',
         student_email: s.email || '',
         student_avatar: s.avatar_url || null,
+        student_track: s.track_name || null,
+        student_level: s.regular_class || s.instrument || null,
+        approval_status: r.approval_status || 'pending',
       };
     });
 
@@ -470,6 +580,11 @@ async function getAttendanceSubmissions(req, res) {
       absent: list.filter((r) => r.status === 'absent').length,
       excused: list.filter((r) => r.status === 'excused').length,
       uniqueStudents: new Set(list.map((r) => r.student_id)).size,
+      pending: list.filter(
+        (r) => (r.approval_status || 'pending') === 'pending'
+      ).length,
+      approved: list.filter((r) => r.approval_status === 'approved').length,
+      rejected: list.filter((r) => r.approval_status === 'rejected').length,
     };
 
     res.json({
@@ -484,6 +599,339 @@ async function getAttendanceSubmissions(req, res) {
       error: 'Failed to fetch attendance submissions',
       details: err.message,
     });
+  }
+}
+
+async function approveAttendance(req, res) {
+  try {
+    const staffId = req.user.id;
+    const { attendanceId } = req.params;
+    const { approval } = req.body || {};
+
+    if (!['approved', 'rejected', 'pending'].includes(approval)) {
+      return res
+        .status(400)
+        .json({ error: 'approval must be approved | rejected | pending' });
+    }
+
+    const myStudents = await getMyStudents(staffId);
+    const allowed = new Set(myStudents.map((s) => s.id));
+
+    const { data: rows } = await supabaseAdmin
+      .from('attendance')
+      .select('id, student_id')
+      .eq('id', attendanceId)
+      .limit(1);
+
+    if (!rows?.[0]) {
+      return res.status(404).json({ error: 'Attendance not found' });
+    }
+    if (!allowed.has(rows[0].student_id)) {
+      return res.status(403).json({ error: 'Not your student' });
+    }
+
+    const { data, error } = await supabaseAdmin
+      .from('attendance')
+      .update({
+        approval_status: approval,
+        approved_by: approval === 'pending' ? null : staffId,
+        approved_at:
+          approval === 'pending' ? null : new Date().toISOString(),
+      })
+      .eq('id', attendanceId)
+      .select()
+      .single();
+    if (error) throw error;
+
+    res.json({ success: true, attendance: data });
+  } catch (err) {
+    console.error('❌ approveAttendance:', err.message);
+    res.status(500).json({ error: 'Failed to update approval' });
+  }
+}
+
+async function bulkApproveAttendance(req, res) {
+  try {
+    const staffId = req.user.id;
+    const { ids, approval } = req.body || {};
+
+    if (!Array.isArray(ids) || ids.length === 0) {
+      return res.status(400).json({ error: 'ids[] is required' });
+    }
+    if (!['approved', 'rejected', 'pending'].includes(approval)) {
+      return res.status(400).json({ error: 'invalid approval value' });
+    }
+
+    const myStudents = await getMyStudents(staffId);
+    const allowed = new Set(myStudents.map((s) => s.id));
+
+    const { data: rows } = await supabaseAdmin
+      .from('attendance')
+      .select('id, student_id')
+      .in('id', ids);
+
+    const validIds = (rows || [])
+      .filter((r) => allowed.has(r.student_id))
+      .map((r) => r.id);
+
+    if (validIds.length === 0) {
+      return res.status(403).json({ error: 'No valid records' });
+    }
+
+    const { data, error } = await supabaseAdmin
+      .from('attendance')
+      .update({
+        approval_status: approval,
+        approved_by: approval === 'pending' ? null : staffId,
+        approved_at:
+          approval === 'pending' ? null : new Date().toISOString(),
+      })
+      .in('id', validIds)
+      .select();
+    if (error) throw error;
+
+    res.json({
+      success: true,
+      updated: data?.length || 0,
+      skipped: ids.length - validIds.length,
+    });
+  } catch (err) {
+    console.error('❌ bulkApproveAttendance:', err.message);
+    res.status(500).json({ error: 'Failed to bulk-approve' });
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// CLASS SESSIONS — start / end / list
+// ═══════════════════════════════════════════════════════════════
+
+// POST /api/staff/sessions/start
+// body: { class_ids[], title, description, meeting_url, meeting_id, passcode, notify }
+async function startSession(req, res) {
+  try {
+    const staffId = req.user.id;
+    const {
+      class_ids,
+      class_id,
+      title,
+      description,
+      meeting_url,
+      meeting_id,
+      passcode,
+      notify = true,
+    } = req.body || {};
+
+    const ids =
+      Array.isArray(class_ids) && class_ids.length > 0
+        ? class_ids
+        : class_id
+        ? [class_id]
+        : [];
+
+    if (ids.length === 0) {
+      return res.status(400).json({ error: 'Select at least one class' });
+    }
+    if (!meeting_url || !String(meeting_url).trim()) {
+      return res.status(400).json({ error: 'Meeting link is required' });
+    }
+
+    const { data: cls, error: clsErr } = await supabaseAdmin
+      .from('classes')
+      .select('id, title, subject, instructor_id')
+      .in('id', ids);
+    if (clsErr) throw clsErr;
+
+    const owned = (cls || []).filter((c) => c.instructor_id === staffId);
+    if (owned.length === 0) {
+      return res
+        .status(403)
+        .json({ error: 'None of the selected classes belong to you' });
+    }
+
+    // Auto-close existing live sessions for these classes
+    await supabaseAdmin
+      .from('class_sessions')
+      .update({
+        status: 'completed',
+        ended_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      })
+      .in('class_id', owned.map((c) => c.id))
+      .eq('status', 'live');
+
+    const now = new Date().toISOString();
+    const baseTitle = (title || '').trim();
+    const rows = owned.map((c) => ({
+      class_id: c.id,
+      staff_id: staffId,
+      title: baseTitle || `${c.title || c.subject || 'Class'} — Live Session`,
+      description: description || null,
+      meeting_url: String(meeting_url).trim(),
+      meeting_id: meeting_id || null,
+      passcode: passcode || null,
+      scheduled_at: now,
+      started_at: now,
+      status: 'live',
+      created_at: now,
+      updated_at: now,
+    }));
+
+    const { data: created, error } = await supabaseAdmin
+      .from('class_sessions')
+      .insert(rows)
+      .select();
+    if (error) throw error;
+
+    // Notify enrolled students
+    let notified = 0;
+    if (notify) {
+      try {
+        const { data: enrolls } = await supabaseAdmin
+          .from('student_classes')
+          .select('student_id')
+          .in('class_id', owned.map((c) => c.id))
+          .eq('status', 'active');
+
+        const studentIds = [
+          ...new Set((enrolls || []).map((e) => e.student_id).filter(Boolean)),
+        ];
+
+        if (studentIds.length > 0) {
+          const { data: students } = await supabaseAdmin
+            .from('students')
+            .select('id, user_id')
+            .in('id', studentIds);
+
+          const userIds = (students || [])
+            .map((s) => s.user_id)
+            .filter(Boolean);
+
+          if (userIds.length > 0) {
+            const classTitle =
+              owned[0].title || owned[0].subject || 'your class';
+            const notifTitle = baseTitle
+              ? `Live now: ${baseTitle}`
+              : `Live now: ${classTitle}`;
+            const notifMessage =
+              'Your class is now in session. Open your Classes page to join.';
+
+            const notifRows = userIds.map((uid) => ({
+              user_id: uid,
+              type: 'class_session',
+              title: notifTitle,
+              message: notifMessage,
+              link: '/student/classes',
+              meta: {
+                session_ids: (created || []).map((c) => c.id),
+                meeting_url: String(meeting_url).trim(),
+              },
+              is_read: false,
+              created_at: new Date().toISOString(),
+            }));
+
+            const { error: notifErr } = await supabaseAdmin
+              .from('notifications')
+              .insert(notifRows);
+
+            if (notifErr) {
+              console.warn('⚠️ notify insert failed:', notifErr.message);
+            } else {
+              notified = notifRows.length;
+            }
+          }
+        }
+      } catch (notifyErr) {
+        console.warn('⚠️ student notify failed:', notifyErr.message);
+      }
+    }
+
+    res.status(201).json({
+      success: true,
+      sessions: created || [],
+      notified,
+    });
+  } catch (err) {
+    console.error('❌ startSession:', err.message);
+    res
+      .status(500)
+      .json({ error: 'Failed to start session', details: err.message });
+  }
+}
+
+// POST /api/staff/sessions/:sessionId/end
+async function endSession(req, res) {
+  try {
+    const staffId = req.user.id;
+    const { sessionId } = req.params;
+    const { recording_url } = req.body || {};
+
+    const { data: rows } = await supabaseAdmin
+      .from('class_sessions')
+      .select('id, staff_id, started_at, status')
+      .eq('id', sessionId)
+      .limit(1);
+
+    if (!rows?.[0]) {
+      return res.status(404).json({ error: 'Session not found' });
+    }
+    if (rows[0].staff_id !== staffId) {
+      return res.status(403).json({ error: 'Not your session' });
+    }
+    if (rows[0].status === 'completed') {
+      return res.json({ success: true, session: rows[0], alreadyEnded: true });
+    }
+
+    const startedAt = rows[0].started_at
+      ? new Date(rows[0].started_at)
+      : new Date();
+    const endedAt = new Date();
+    const duration = Math.max(
+      1,
+      Math.round((endedAt.getTime() - startedAt.getTime()) / 60000)
+    );
+
+    const { data, error } = await supabaseAdmin
+      .from('class_sessions')
+      .update({
+        status: 'completed',
+        ended_at: endedAt.toISOString(),
+        duration_minutes: duration,
+        recording_url: recording_url || null,
+        updated_at: endedAt.toISOString(),
+      })
+      .eq('id', sessionId)
+      .select()
+      .single();
+    if (error) throw error;
+
+    res.json({ success: true, session: data });
+  } catch (err) {
+    console.error('❌ endSession:', err.message);
+    res.status(500).json({ error: 'Failed to end session' });
+  }
+}
+
+// GET /api/staff/sessions
+async function getStaffSessions(req, res) {
+  try {
+    const staffId = req.user.id;
+
+    const { data, error } = await supabaseAdmin
+      .from('class_sessions')
+      .select('*, class:class_id ( id, title, subject )')
+      .eq('staff_id', staffId)
+      .order('started_at', { ascending: false })
+      .limit(100);
+    if (error) throw error;
+
+    const sessions = data || [];
+    const live = sessions.filter((s) => s.status === 'live');
+    const recent = sessions.filter((s) => s.status !== 'live');
+
+    res.json({ success: true, sessions, live, recent });
+  } catch (err) {
+    console.error('❌ getStaffSessions:', err.message);
+    res.status(500).json({ error: 'Failed to fetch sessions' });
   }
 }
 
@@ -902,7 +1350,7 @@ async function getSubmissions(req, res) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// EXPORTS — all functions
+// EXPORTS
 // ═══════════════════════════════════════════════════════════════
 module.exports = {
   getMe,
@@ -913,6 +1361,11 @@ module.exports = {
   markAttendance,
   getAttendanceHistory,
   getAttendanceSubmissions,
+  approveAttendance,
+  bulkApproveAttendance,
+  startSession,
+  endSession,
+  getStaffSessions,
   submitScores,
   submitResults,
   getAssignments,

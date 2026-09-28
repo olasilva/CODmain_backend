@@ -155,6 +155,9 @@ async function initializePayment(req, res) {
 
     const paymentId = `PAY-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
 
+    // ── Save pending payment ──
+    // `course` is the CAMPUS (e.g. "Lugbe Campus") — stored in its own column
+    // so we can pre-fill it on future renewals.
     const { data: payment, error: insertErr } = await supabaseAdmin
       .from('payments')
       .insert([{
@@ -164,6 +167,7 @@ async function initializePayment(req, res) {
         amount: Number(amount),
         currency: 'NGN',
         plan: plan || 'termly',
+        course: course || null,                       // ← ADDED
         payment_type: 'school_fees',
         description: [course, trackName].filter(Boolean).join(' · ') || null,
         status: 'pending',

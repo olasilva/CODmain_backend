@@ -2,7 +2,7 @@
 const express = require('express');
 const router = express.Router();
 const staffController = require('../controllers/staffController');
-const notificationController = require('../controllers/notificationController'); // ← NEW
+const notificationController = require('../controllers/notificationController');
 const { authenticateToken, requireStaffOrAdmin } = require('../middleware/auth');
 
 // Every staff route requires staff or admin
@@ -31,12 +31,23 @@ router.get('/messages/:studentId', staffController.getConversation);
 router.post('/messages', staffController.sendMessage);
 
 // ─── Attendance ───
+// NOTE: specific paths must come BEFORE generic ones.
 router.get('/attendance/submissions', staffController.getAttendanceSubmissions);
 router.get('/attendance/students', staffController.getAttendanceStudents);
 router.get('/attendance/history', staffController.getAttendanceHistory);
+
+// Approval routes — bulk must come BEFORE the parametrised one
+router.post('/attendance/bulk-approve', staffController.bulkApproveAttendance);
+router.post('/attendance/:attendanceId/approve', staffController.approveAttendance);
+
+// Manual marking (staff marks attendance themselves → auto-approved)
 router.post('/attendance', staffController.markAttendance);
 
-// ─── Notifications (NEW) ───
+// ─── Class sessions ───
+router.get('/sessions', staffController.getStaffSessions);
+router.post('/sessions/start', staffController.startSession);
+router.post('/sessions/:sessionId/end', staffController.endSession);
+// ─── Notifications ───
 router.get('/notifications', notificationController.getStaffNotifications);
 router.put('/notifications/read-all', notificationController.markAllStaffNotificationsRead);
 router.put('/notifications/:id/read', notificationController.markStaffNotificationRead);

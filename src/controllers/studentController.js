@@ -6,7 +6,7 @@ const supabaseService = require('../services/supabaseService');
 async function findStudent(userId) {
   const { data, error } = await supabaseAdmin
     .from('students')
-    .select('id, user_id, student_id, full_name, status')
+    .select('id, user_id, student_id, full_name, email, status')
     .eq('user_id', userId)
     .order('created_at', { ascending: true })
     .limit(1);
@@ -452,6 +452,86 @@ async function getClassDetails(req, res) {
   }
 }
 
+// ============ CLASS SESSIONS ============
+async function getStudentSessions(req, res) {
+  try {
+    const userId = req.user.id;
+
+    const student = await findStudent(userId);
+    if (!student) {
+      return res.json({
+        success: true,
+        live: [],
+        recent: [],
+        sessions: [],
+        recordings: [],
+      });
+    }
+
+    const { data: myClassRows } = await supabaseAdmin
+      .from('student_classes')
+      .select('class_id')
+      .eq('student_id', student.id)
+      .eq('status', 'active');
+
+    const classIds = (myClassRows || []).map((r) => r.class_id).filter(Boolean);
+    if (classIds.length === 0) {
+      return res.json({
+        success: true,
+        live: [],
+        recent: [],
+        sessions: [],
+        recordings: [],
+      });
+    }
+
+    const { data: rows, error } = await supabaseAdmin
+      .from('class_sessions')
+      .select(
+        `id, class_id, staff_id, title, description,
+         meeting_url, recording_url, scheduled_at,
+         started_at, ended_at, duration_minutes, status,
+         class:class_id ( id, title, subject ),
+         instructor:staff_id ( id, full_name, avatar_url )`
+      )
+      .in('class_id', classIds)
+      .order('started_at', { ascending: false })
+      .limit(80);
+    if (error) throw error;
+
+    const sessions = rows || [];
+
+    const live = sessions.filter((s) => s.status === 'live');
+
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - 60);
+    const recent = sessions.filter(
+      (s) =>
+        s.status === 'completed' &&
+        s.started_at &&
+        new Date(s.started_at) >= cutoff
+    );
+
+    const recordings = sessions
+      .filter((s) => s.recording_url)
+      .map((s) => ({
+        id: s.id,
+        title: s.title || 'Class recording',
+        instructor: s.instructor?.full_name || '',
+        date: s.started_at,
+        duration:
+          s.duration_minutes != null ? `${s.duration_minutes} min` : '—',
+        url: s.recording_url,
+        class: s.class?.title || null,
+      }));
+
+    res.json({ success: true, sessions, live, recent, recordings });
+  } catch (err) {
+    console.error('❌ getStudentSessions:', err.message);
+    res.status(500).json({ error: 'Failed to fetch sessions' });
+  }
+}
+
 // ============ RESULTS ============
 async function getResults(req, res) {
   try {
@@ -608,7 +688,59 @@ async function getPaymentDetails(req, res) {
   }
 }
 
-// ============ FEES (countdown) ============
+// ============ PAYMENT CONTEXT ============
+async function getPaymentContext(req, res) {
+  try {
+    const userId = req.user.id;
+
+    const student = await findStudent(userId);
+    if (!student) {
+      return res.json({ success: true, context: null, reason: 'no_student' });
+    }
+
+    const { data: admRows, error } = await supabaseAdmin
+      .from('admissions')
+      .select('*')
+      .eq('student_id', student.id)
+      .order('created_at', { ascending: false })
+      .limit(1);
+    if (error) throw error;
+
+    const adm = admRows?.[0] || null;
+    if (!adm) {
+      return res.json({ success: true, context: null, reason: 'no_admission' });
+    }
+
+    let email = student.email || null;
+    if (!email) {
+      const { data: userRows } = await supabaseAdmin
+        .from('users')
+        .select('email')
+        .eq('id', userId)
+        .limit(1);
+      email = userRows?.[0]?.email || null;
+    }
+
+    return res.json({
+      success: true,
+      context: {
+        course: adm.course || null,
+        trackName: adm.track_name || null,
+        formData: adm.form_data || adm.formData || {},
+        applicationId: adm.id,
+        studentName: student.full_name || null,
+        email,
+      },
+    });
+  } catch (error) {
+    console.error('❌ getPaymentContext error:', error.message);
+    return res
+      .status(500)
+      .json({ error: 'Failed to build payment context', details: error.message });
+  }
+}
+
+// ============ FEES ============
 async function getMyFees(req, res) {
   try {
     const userId = req.user.id;
@@ -645,13 +777,7 @@ async function getMyFees(req, res) {
       const paidDate = new Date(latest.payment_date || latest.created_at);
       const plan = (latest.plan || 'monthly').toLowerCase();
       const planDays =
-        plan === 'termly'
-          ? 90
-          : plan === 'monthly'
-          ? 30
-          : plan === 'daily'
-          ? 1
-          : 30;
+        plan === 'termly' ? 90 : plan === 'monthly' ? 30 : plan === 'daily' ? 1 : 30;
 
       const expiresAt = new Date(paidDate);
       expiresAt.setDate(expiresAt.getDate() + planDays);
@@ -662,10 +788,7 @@ async function getMyFees(req, res) {
       const hoursRemaining = Math.ceil(msRemaining / 3600000);
       const minutesRemaining = Math.ceil(msRemaining / 60000);
       const daysUsed = Math.max(0, planDays - daysRemaining);
-      const progress = Math.min(
-        100,
-        Math.max(0, (daysUsed / planDays) * 100)
-      );
+      const progress = Math.min(100, Math.max(0, (daysUsed / planDays) * 100));
 
       fees = {
         plan,
@@ -823,9 +946,8 @@ async function submitAttendance(req, res) {
   }
 }
 
-// ============ TEACHER MESSAGING (NEW) ============
+// ============ TEACHER MESSAGING ============
 
-// GET /api/student/teachers
 async function getMyTeachers(req, res) {
   try {
     const userId = req.user.id;
@@ -835,7 +957,6 @@ async function getMyTeachers(req, res) {
       return res.json({ success: true, teachers: [] });
     }
 
-    // 1. Student's latest admission
     const { data: admRows } = await supabaseAdmin
       .from('admissions')
       .select('track_name, regular_class, instrument')
@@ -844,46 +965,60 @@ async function getMyTeachers(req, res) {
       .limit(1);
     const adm = admRows?.[0] || null;
 
-    // 2. Get all staff
     const { data: allStaff, error: staffErr } = await supabaseAdmin
       .from('users')
       .select(
         'id, full_name, email, avatar_url, department, staff_category, staff_levels'
       )
-      .in('role', ['staff', 'admin']);
+      .eq('role', 'staff');
     if (staffErr) throw staffErr;
 
-    const studentTrack = (adm?.track_name || '').toLowerCase();
+    const norm = (s) => String(s || '').toLowerCase().trim();
+
+    const studentTrackRaw = norm(adm?.track_name);
     const studentLevels = [adm?.regular_class, adm?.instrument].filter(Boolean);
 
-    // 3. Filter staff who match the student's track + levels
+    let studentTrackType = 'unknown';
+    if (studentTrackRaw.includes('mixed')) studentTrackType = 'mixed';
+    else if (studentTrackRaw.includes('regular')) studentTrackType = 'regular';
+    else if (studentTrackRaw.includes('music')) studentTrackType = 'music';
+
+    const MUSIC_KEYWORDS = [
+      'music', 'instrument', 'band', 'orchestr', 'choir',
+      'piano', 'keyboard', 'guitar', 'bass', 'violin', 'cello',
+      'flute', 'sax', 'trumpet', 'drum', 'percussion', 'vocal', 'voice', 'sing',
+    ];
+    const REGULAR_KEYWORDS = [
+      'regular', 'academ', 'primary', 'secondar', 'prim', 'sec',
+      'general', 'nursery', 'jss', 'sss', 'rgl',
+    ];
+
+    const hasAny = (h, list) => list.some((k) => h.includes(k));
+    const catLooksMusic = (c) => hasAny(c, MUSIC_KEYWORDS);
+    const catLooksRegular = (c) => hasAny(c, REGULAR_KEYWORDS);
+    const catIsUniversal = (c) =>
+      !c ||
+      c === 'mixed' ||
+      c === 'both' ||
+      c === 'all' ||
+      c === 'any' ||
+      c.includes('mixed') ||
+      c.includes('general');
+
     const matched = (allStaff || []).filter((s) => {
-      if (!s.staff_category) return false;
-
-      const cat = s.staff_category.toLowerCase();
-      const catMatches =
-        cat === 'mixed' ||
-        (cat === 'regular' && studentTrack.includes('regular')) ||
-        (cat === 'music' && studentTrack.includes('music')) ||
-        studentTrack.includes('mixed');
-
-      if (!catMatches) return false;
-
-      const levels = Array.isArray(s.staff_levels) ? s.staff_levels : [];
-      if (levels.length === 0) return true;
-
-      return levels.some((lvl) =>
-        studentLevels.some(
-          (sl) => String(sl).toLowerCase() === String(lvl).toLowerCase()
-        )
-      );
+      const cat = norm(s.staff_category);
+      if (catIsUniversal(cat)) return true;
+      if (studentTrackType === 'unknown') return true;
+      if (studentTrackType === 'mixed') return true;
+      if (studentTrackType === 'regular') return !catLooksMusic(cat);
+      if (studentTrackType === 'music') return !catLooksRegular(cat);
+      return true;
     });
 
     if (matched.length === 0) {
       return res.json({ success: true, teachers: [] });
     }
 
-    // 4. Latest message between student and each teacher
     const teacherIds = matched.map((t) => t.id);
     const { data: msgs } = await supabaseAdmin
       .from('messages')
@@ -933,7 +1068,142 @@ async function getMyTeachers(req, res) {
   }
 }
 
-// GET /api/student/messages/:teacherUserId
+async function getStaffDirectory(req, res) {
+  try {
+    const userId = req.user.id;
+
+    const student = await findStudent(userId);
+    if (!student) {
+      return res.json({ success: true, staff: [] });
+    }
+
+    const { data: admRows } = await supabaseAdmin
+      .from('admissions')
+      .select('track_name, regular_class, instrument')
+      .eq('student_id', student.id)
+      .order('created_at', { ascending: false })
+      .limit(1);
+    const adm = admRows?.[0] || null;
+
+    const norm = (s) => String(s || '').toLowerCase().trim();
+    const studentTrackRaw = norm(adm?.track_name);
+    const studentLevels = [adm?.regular_class, adm?.instrument].filter(Boolean);
+
+    let studentTrackType = 'unknown';
+    if (studentTrackRaw.includes('mixed')) studentTrackType = 'mixed';
+    else if (studentTrackRaw.includes('regular')) studentTrackType = 'regular';
+    else if (studentTrackRaw.includes('music')) studentTrackType = 'music';
+
+    const MUSIC_KEYWORDS = [
+      'music', 'instrument', 'band', 'orchestr', 'choir',
+      'piano', 'keyboard', 'guitar', 'bass', 'violin', 'cello',
+      'flute', 'sax', 'trumpet', 'drum', 'percussion', 'vocal', 'voice', 'sing',
+    ];
+    const REGULAR_KEYWORDS = [
+      'regular', 'academ', 'primary', 'secondar', 'prim', 'sec',
+      'general', 'nursery', 'jss', 'sss', 'rgl',
+    ];
+
+    const hasAny = (h, list) => list.some((k) => h.includes(k));
+    const catLooksMusic = (c) => hasAny(c, MUSIC_KEYWORDS);
+    const catLooksRegular = (c) => hasAny(c, REGULAR_KEYWORDS);
+    const catIsUniversal = (c) =>
+      !c ||
+      c === 'mixed' ||
+      c === 'both' ||
+      c === 'all' ||
+      c === 'any' ||
+      c.includes('mixed') ||
+      c.includes('general');
+
+    const { data: allStaff, error } = await supabaseAdmin
+      .from('users')
+      .select(
+        'id, full_name, email, avatar_url, department, staff_category, staff_levels'
+      )
+      .eq('role', 'staff');
+    if (error) throw error;
+
+    const inCategory = (allStaff || []).filter((s) => {
+      const cat = norm(s.staff_category);
+      if (catIsUniversal(cat)) return true;
+      if (studentTrackType === 'unknown') return true;
+      if (studentTrackType === 'mixed') return true;
+      if (studentTrackType === 'regular') return !catLooksMusic(cat);
+      if (studentTrackType === 'music') return !catLooksRegular(cat);
+      return true;
+    });
+
+    const wouldPassLevel = (s) => {
+      const levels = Array.isArray(s.staff_levels) ? s.staff_levels : [];
+      if (levels.length === 0) return true;
+      if (studentLevels.length === 0) return true;
+      return levels.some((lvl) =>
+        studentLevels.some((sl) => {
+          const a = norm(sl);
+          const b = norm(lvl);
+          return a === b || a.includes(b) || b.includes(a);
+        })
+      );
+    };
+
+    const levelFiltered = inCategory.filter(wouldPassLevel);
+    const categoryAndLevel =
+      levelFiltered.length > 0 ? levelFiltered : inCategory;
+
+    const q = norm(req.query.q);
+    const searched = q
+      ? categoryAndLevel.filter((s) => {
+          const hay = [
+            s.full_name,
+            s.email,
+            s.department,
+            s.staff_category,
+            ...(Array.isArray(s.staff_levels) ? s.staff_levels : []),
+          ]
+            .filter(Boolean)
+            .join(' ')
+            .toLowerCase();
+          return hay.includes(q);
+        })
+      : categoryAndLevel;
+
+    let finalList = searched;
+    if (q && finalList.length === 0) {
+      finalList = (allStaff || []).filter((s) => {
+        const hay = [
+          s.full_name,
+          s.email,
+          s.department,
+          s.staff_category,
+          ...(Array.isArray(s.staff_levels) ? s.staff_levels : []),
+        ]
+          .filter(Boolean)
+          .join(' ')
+          .toLowerCase();
+        return hay.includes(q);
+      });
+    }
+
+    const staff = finalList.map((s) => ({
+      id: s.id,
+      name: s.full_name || 'Staff',
+      email: s.email || null,
+      avatar_url: s.avatar_url || null,
+      department: s.department || null,
+      category: s.staff_category || null,
+      levels: Array.isArray(s.staff_levels) ? s.staff_levels : [],
+    }));
+
+    staff.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+
+    return res.json({ success: true, staff });
+  } catch (error) {
+    console.error('❌ getStaffDirectory error:', error.message);
+    return res.status(500).json({ error: 'Failed to load staff directory' });
+  }
+}
+
 async function getConversationWithTeacher(req, res) {
   try {
     const userId = req.user.id;
@@ -948,7 +1218,7 @@ async function getConversationWithTeacher(req, res) {
       .from('users')
       .select('id, full_name, email, avatar_url, role, department')
       .eq('id', teacherUserId)
-      .in('role', ['staff', 'admin'])
+      .eq('role', 'staff')
       .maybeSingle();
 
     if (!teacher) {
@@ -983,7 +1253,6 @@ async function getConversationWithTeacher(req, res) {
   }
 }
 
-// POST /api/student/messages
 async function sendMessageToTeacher(req, res) {
   try {
     const userId = req.user.id;
@@ -1005,7 +1274,7 @@ async function sendMessageToTeacher(req, res) {
       .from('users')
       .select('id, full_name, email')
       .eq('id', teacherUserId)
-      .in('role', ['staff', 'admin'])
+      .eq('role', 'staff')
       .maybeSingle();
     if (!teacher) {
       return res.status(404).json({ error: 'Teacher not found' });
@@ -1028,15 +1297,13 @@ async function sendMessageToTeacher(req, res) {
       .single();
     if (error) throw error;
 
-    // Best-effort staff notification
     try {
       const notificationController = require('./notificationController');
       await notificationController.pushStaffNotification({
         staffId: teacherUserId,
         type: 'student_message',
         title: `New message from ${student.full_name || 'a student'}`,
-        message:
-          msgBody.length > 80 ? `${msgBody.slice(0, 80)}…` : msgBody,
+        message: msgBody.length > 80 ? `${msgBody.slice(0, 80)}…` : msgBody,
         link: `/staff/messages?student=${student.id}`,
         meta: { studentId: student.id, senderId: userId },
       });
@@ -1139,14 +1406,17 @@ module.exports = {
   submitAssignment,
   getClasses,
   getClassDetails,
+  getStudentSessions,
   getResults,
   getResultDetails,
   getPayments,
   getPaymentDetails,
+  getPaymentContext,
   getMyFees,
   getMyAttendance,
   submitAttendance,
   getMyTeachers,
+  getStaffDirectory,
   getConversationWithTeacher,
   sendMessageToTeacher,
   getMaterials,

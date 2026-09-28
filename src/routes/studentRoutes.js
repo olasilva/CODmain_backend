@@ -11,7 +11,7 @@ const { authenticateToken } = require('../middleware/auth');
 router.get('/profile', authenticateToken, studentController.getProfile);
 router.put('/profile', authenticateToken, studentController.updateProfile);
 
-// ─── My programme & classes (from admission) ───
+// ─── My programme & classes ───
 router.get('/my-programme', authenticateToken, studentController.getMyProgramme);
 router.get('/my-classes', authenticateToken, studentController.getMyEnrolledClasses);
 
@@ -21,8 +21,9 @@ router.post('/attendance', authenticateToken, studentController.submitAttendance
 
 // ─── Fees ───
 router.get('/fees', authenticateToken, studentController.getMyFees);
+router.get('/payment-context', authenticateToken, studentController.getPaymentContext);
 
-// ─── Courses (legacy, kept for compat) ───
+// ─── Courses (legacy) ───
 router.get('/courses', authenticateToken, studentController.getCourses);
 router.get('/courses/:courseId', authenticateToken, studentController.getCourseDetails);
 
@@ -34,6 +35,9 @@ router.post('/assignments/:assignmentId/submit', authenticateToken, studentContr
 // ─── Classes ───
 router.get('/classes', authenticateToken, studentController.getClasses);
 router.get('/classes/:classId', authenticateToken, studentController.getClassDetails);
+
+// ─── Class sessions ───
+router.get('/sessions', authenticateToken, studentController.getStudentSessions);
 
 // ─── Results ───
 router.get('/results', authenticateToken, studentController.getResults);
@@ -49,8 +53,8 @@ router.put('/notifications/:notificationId/read', authenticateToken, notificatio
 router.put('/notifications/read-all', authenticateToken, notificationController.markAllAsRead);
 
 // ─── Teacher messaging ───
-// NOTE: specific paths must come BEFORE the generic /messages
 router.get('/teachers', authenticateToken, studentController.getMyTeachers);
+router.get('/staff-directory', authenticateToken, studentController.getStaffDirectory);
 router.get('/messages/unread-count', authenticateToken, messageController.getUnreadCount);
 router.put('/messages/:messageId/read', authenticateToken, messageController.markAsRead);
 router.get('/messages/:teacherUserId', authenticateToken, studentController.getConversationWithTeacher);
