@@ -26,7 +26,7 @@ const settingsRoutes = require('./routes/settingsRoutes');
 const reportRoutes = require('./routes/reportRoutes');
 const uploadRoutes = require('./routes/uploadRoutes');
 const sessionRoutes = require('./routes/sessionRoutes');
-const contactRoutes = require('./routes/contactRoutes');   // ← NEW
+const contactRoutes = require('./routes/contactRoutes');
 
 const app = express();
 
@@ -38,11 +38,19 @@ app.use(helmet());
 
 // ─── Static origins (always allowed) ───
 const staticOrigins = [
+  // Local development
   'http://localhost:3000',
   'http://localhost:5173',
   'http://127.0.0.1:5173',
   'http://localhost:5174',
+  'http://127.0.0.1:5174',
+
+  // Vercel frontend (default domain)
   'https://co-dmain.vercel.app',
+
+  // Production custom domains
+  'https://clanofdavidmusic.com.ng',
+  'https://www.clanofdavidmusic.com.ng',
 ];
 
 // ─── Extra origins from FRONTEND_URL (comma-separated) ───
@@ -62,8 +70,13 @@ console.log('🔓 CORS allowlist:', allowedOrigins);
 app.use(
   cors({
     origin: (origin, callback) => {
+      // Allow server-to-server / Postman requests (no origin header)
       if (!origin) return callback(null, true);
+
+      // Exact allowlist match
       if (allowedOrigins.includes(origin)) return callback(null, true);
+
+      // Vercel preview deployments
       if (vercelPreviewRegex.test(origin)) return callback(null, true);
 
       console.warn('🚫 CORS blocked origin:', origin);
@@ -75,6 +88,7 @@ app.use(
   })
 );
 
+// Handle preflight for all routes
 app.options('*', cors());
 
 // ═══════════════════════════════════════════════════════════════
@@ -111,7 +125,10 @@ app.use(
     secret: process.env.SESSION_SECRET || 'fallback_secret_for_dev',
     resave: false,
     saveUninitialized: false,
-    cookie: { secure: process.env.NODE_ENV === 'production' },
+    cookie: {
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
+    },
   })
 );
 app.use(passport.initialize());
@@ -137,7 +154,7 @@ app.use('/api/messages', messageRoutes);
 app.use('/api/notifications', notificationRoutes);
 app.use('/api/settings', settingsRoutes);
 app.use('/api/reports', reportRoutes);
-app.use('/api/contact', contactRoutes);   // ← NEW
+app.use('/api/contact', contactRoutes);
 
 // ─── Online sessions (staff + student) ───
 app.use('/api', sessionRoutes);
