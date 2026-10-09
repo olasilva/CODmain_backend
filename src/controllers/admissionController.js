@@ -74,7 +74,7 @@ class AdmissionController {
           .from('students')
           .insert([{
             user_id: userId,
-            student_id: `STU-${Date.now()}`,
+            student_id: null,
             full_name: studentName || user?.full_name || user?.email?.split('@')[0] || null,
             academic_year: academicYear,
             status: 'active',
@@ -229,6 +229,83 @@ class AdmissionController {
       res.status(500).json({
         success: false,
         error: 'Failed to fetch admission status',
+        details: error.message,
+      });
+    }
+  }
+
+  // =========================================================
+  // POST /api/admissions/:admissionId/payment-submitted
+  // =========================================================
+  async submitPaymentConfirmation(req, res) {
+    try {
+      const userId = req.user?.id;
+      const { admissionId } = req.params;
+      const amountValue =
+        req.body?.amountPaid ??
+        req.body?.amount_paid ??
+        req.body?.selectedAmount ??
+        req.body?.selected_amount ??
+        req.body?.amountToPay ??
+        req.body?.amount_to_pay ??
+        req.body?.amount;
+      const amountPaid = Number(amountValue);
+      if (
+        amountValue === undefined ||
+        amountValue === null ||
+        amountValue === '' ||
+        !Number.isFinite(amountPaid) ||
+        amountPaid <= 0
+      ) {
+        return res.status(400).json({ success: false, error: 'amountPaid must be a positive number' });
+      }
+      const { data: studentRows, error: studentError } = await supabaseAdmin
+        .from('students')
+        .select('id')
+        .eq('user_id', userId)
+        .order('created_at', { ascending: true })
+        .limit(1);
+      if (studentError) throw studentError;
+      const student = studentRows?.[0];
+      if (!student) {
+        return res.status(404).json({ success: false, error: 'Student record not found' });
+      }
+
+      const { data: admission, error: admissionError } = await supabaseAdmin
+        .from('admissions')
+        .select('id, status')
+        .eq('id', admissionId)
+        .eq('student_id', student.id)
+        .maybeSingle();
+      if (admissionError) throw admissionError;
+      if (!admission) {
+        return res.status(404).json({ success: false, error: 'Admission not found' });
+      }
+      if (admission.status === 'approved') {
+        return res.status(409).json({ success: false, error: 'Admission is already approved' });
+      }
+
+      const admissionUpdates = { status: 'payment_submitted' };
+      admissionUpdates.amount_paid = amountPaid;
+
+      const { data: updatedAdmission, error: updateError } = await supabaseAdmin
+        .from('admissions')
+        .update(admissionUpdates)
+        .eq('id', admissionId)
+        .select()
+        .single();
+      if (updateError) throw updateError;
+
+      return res.json({
+        success: true,
+        message: 'Payment reported. Your admission is awaiting admin approval.',
+        admission: updatedAdmission,
+      });
+    } catch (error) {
+      console.error('❌ submitPaymentConfirmation error:', error.message);
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to report payment',
         details: error.message,
       });
     }

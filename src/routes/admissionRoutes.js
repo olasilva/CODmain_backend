@@ -12,6 +12,11 @@ router.get('/programmes/:programmeId', admissionController.getProgrammeById);
 router.post('/start', authenticateToken, admissionController.startAdmission);
 router.get('/status', authenticateToken, admissionController.getAdmissionStatus);
 router.post(
+  '/:admissionId/payment-submitted',
+  authenticateToken,
+  admissionController.submitPaymentConfirmation
+);
+router.post(
   '/:admissionId/documents',
   authenticateToken,
   admissionController.submitDocuments

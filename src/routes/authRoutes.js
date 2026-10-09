@@ -1,15 +1,25 @@
 // src/routes/authRoutes.js
 const express = require('express');
+const rateLimit = require('express-rate-limit');
 const passport = require('passport');
 const controller = require('../controllers/authController');
 const { authenticateToken, requireAdmin } = require('../middleware/auth');
 
 const router = express.Router();
+const passwordResetLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many password reset attempts. Please try again later.' },
+});
 
 // Public
 router.post('/register', controller.register);
 router.post('/login', controller.login);
 router.post('/google', controller.googleLogin);
+router.post('/forgot-password', passwordResetLimiter, controller.requestPasswordReset);
+router.post('/reset-password', passwordResetLimiter, controller.resetPassword);
 
 // Google OAuth redirect flow
 router.get(

@@ -4,17 +4,38 @@ const router = express.Router();
 const paymentController = require('../controllers/paymentController');
 const { authenticateToken } = require('../middleware/auth');
 
-// Authenticated — user starts a Paystack payment
-router.post('/initialize', authenticateToken, paymentController.initializePayment);
+// ─── Bank transfer (manual payment) ───
+router.get(
+  '/bank-details',
+  authenticateToken,
+  paymentController.getBankDetails
+);
 
-// Public — Paystack redirects the user's browser here (no JWT)
-router.get('/verify', paymentController.verifyPayment);
+router.post(
+  '/bank-transfer',
+  authenticateToken,
+  paymentController.submitBankTransfer
+);
 
-// Public — Paystack posts server-to-server (signature is verified inside)
-router.post('/webhook', paymentController.paystackWebhook);
+// ─── Paystack — retired. Online payments disabled ───
+router.post(
+  '/initialize',
+  authenticateToken,
+  paymentController.bankTransferRequired
+);
+router.get('/verify', paymentController.bankTransferRequired);
+router.post('/webhook', paymentController.bankTransferRequired);
 
-// Authenticated — payment history and invoices
-router.get('/history', authenticateToken, paymentController.getPaymentHistory);
-router.get('/invoices', authenticateToken, paymentController.getInvoices);
+// ─── History & invoices ───
+router.get(
+  '/history',
+  authenticateToken,
+  paymentController.getPaymentHistory
+);
+router.get(
+  '/invoices',
+  authenticateToken,
+  paymentController.getInvoices
+);
 
 module.exports = router;

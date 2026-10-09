@@ -2,7 +2,33 @@
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const supabaseService = require('../services/supabaseService');
+const { supabaseAdmin } = require('../config/supabase');
 const { signToken } = require('../middleware/auth'); // single source of truth
+const { sendMail } = require('../services/emailService');
+
+const PASSWORD_RESET_RESPONSE =
+  'If an account exists for that email, a password reset link has been sent.';
+
+async function getLatestAdmissionStatus(userId) {
+  const { data: students, error: studentError } = await supabaseAdmin
+    .from('students')
+    .select('id')
+    .eq('user_id', userId)
+    .order('created_at', { ascending: true })
+    .limit(1);
+  if (studentError) throw studentError;
+  const student = students?.[0];
+  if (!student) return null;
+
+  const { data: admissions, error: admissionError } = await supabaseAdmin
+    .from('admissions')
+    .select('status')
+    .eq('student_id', student.id)
+    .order('created_at', { ascending: false })
+    .limit(1);
+  if (admissionError) throw admissionError;
+  return admissions?.[0]?.status || null;
+}
 
 /**
  * Get public user data (exclude sensitive fields)
@@ -120,6 +146,16 @@ async function login(req, res) {
         .json({ error: 'Invalid email, password, or account type.' });
     }
 
+    const admissionStatus = user.role === 'student'
+      ? await getLatestAdmissionStatus(user.id)
+      : null;
+    if (user.role === 'student' && admissionStatus?.toLowerCase() !== 'approved') {
+      return res.status(403).json({
+        error: 'Admission is in progress. Your transfer is awaiting admin approval.',
+        code: 'ADMISSION_PENDING',
+      });
+    }
+
     await supabaseService.update('users', user.id, {
       last_login: new Date().toISOString(),
     });
@@ -128,9 +164,12 @@ async function login(req, res) {
 
     console.log('✅ Login successful:', user.email);
 
+    const userData = publicUser(user);
     res.json({
-      user: publicUser(user),
+      user: userData,
       token,
+      message: `Welcome, ${userData.fullName || userData.email}`,
+      admissionStatus,
     });
   } catch (error) {
     console.error('❌ Login error:', error);
@@ -213,11 +252,24 @@ async function googleLogin(req, res) {
       });
     }
 
+    const admissionStatus = user.role === 'student'
+      ? await getLatestAdmissionStatus(user.id)
+      : null;
+    if (user.role === 'student' && admissionStatus?.toLowerCase() !== 'approved') {
+      return res.status(403).json({
+        error: 'Admission is in progress. Your transfer is awaiting admin approval.',
+        code: 'ADMISSION_PENDING',
+      });
+    }
+
     const jwtToken = signToken(user);
 
+    const userData = publicUser(user);
     res.json({
-      user: publicUser(user),
+      user: userData,
       token: jwtToken,
+      message: `Welcome, ${userData.fullName || userData.email}`,
+      admissionStatus,
     });
   } catch (error) {
     console.error('Google login error:', error);
@@ -240,9 +292,18 @@ async function googleCallback(req, res) {
       return res.redirect(`${frontendUrl}/login?error=oauth_failed`);
     }
 
+    const admissionStatus = user.role === 'student'
+      ? await getLatestAdmissionStatus(user.id)
+      : null;
+    if (user.role === 'student' && admissionStatus?.toLowerCase() !== 'approved') {
+      const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
+      return res.redirect(`${frontendUrl}/login?error=admission_pending`);
+    }
+
     const token = signToken(user);
     const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
-    res.redirect(`${frontendUrl}/oauth-callback?token=${token}`);
+    const welcomeName = encodeURIComponent(user.full_name || user.email);
+    res.redirect(`${frontendUrl}/oauth-callback?token=${token}&welcome=${welcomeName}`);
   } catch (error) {
     console.error('Google Callback Error:', error);
     const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
@@ -342,6 +403,98 @@ async function changePassword(req, res) {
   } catch (error) {
     console.error('Change password error:', error);
     res.status(500).json({ error: 'Failed to change password' });
+  }
+}
+
+// ============================================================
+// Request a one-time password reset link
+// ============================================================
+async function requestPasswordReset(req, res) {
+  const email = String(req.body?.email || '').trim().toLowerCase();
+  if (!email) {
+    return res.status(400).json({ error: 'Email is required' });
+  }
+
+  try {
+    const user = await supabaseService.getUserByEmail(email);
+    if (user) {
+      const token = crypto.randomBytes(32).toString('hex');
+      const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+      const now = new Date().toISOString();
+
+      const { error: expireError } = await supabaseAdmin
+        .from('password_reset_tokens')
+        .update({ used_at: now })
+        .eq('user_email', email)
+        .is('used_at', null);
+      if (expireError) throw expireError;
+
+      const { error: insertError } = await supabaseAdmin
+        .from('password_reset_tokens')
+        .insert({
+          user_email: email,
+          token_hash: tokenHash,
+          expires_at: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
+        });
+      if (insertError) throw insertError;
+
+      const frontendUrl =
+        (process.env.FRONTEND_URL || 'http://localhost:5173')
+          .split(',')[0]
+          .trim()
+          .replace(/\/$/, '');
+      const resetUrl = `${frontendUrl}/reset-password?token=${token}`;
+      const emailInfo = await sendMail({
+        to: email,
+        subject: 'Reset your Clan of David account password',
+        text: `We received a request to reset your password. Use this link within 30 minutes: ${resetUrl}\n\nIf you did not request this, you can ignore this email.`,
+        html: `<p>We received a request to reset your password.</p><p><a href="${resetUrl}">Choose a new password</a></p><p>This link expires in 30 minutes. If you did not request this, you can ignore this email.</p>`,
+      });
+      if (!emailInfo) {
+        console.warn('Password reset email could not be sent for account:', email);
+      }
+    }
+
+    return res.json({ success: true, message: PASSWORD_RESET_RESPONSE });
+  } catch (error) {
+    console.error('Password reset request error:', error.message);
+    return res.status(500).json({ error: 'Unable to process password reset request' });
+  }
+}
+
+// ============================================================
+// Consume a reset token and set the new password
+// ============================================================
+async function resetPassword(req, res) {
+  const { token, newPassword } = req.body || {};
+  if (typeof token !== 'string' || !token || typeof newPassword !== 'string') {
+    return res.status(400).json({ error: 'Reset token and new password are required' });
+  }
+  if (newPassword.length < 8 || newPassword.length > 128) {
+    return res.status(400).json({ error: 'Password must be between 8 and 128 characters' });
+  }
+
+  try {
+    const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+    const passwordHash = await bcrypt.hash(newPassword, 12);
+    const { data: reset, error } = await supabaseAdmin.rpc(
+      'reset_password_with_token',
+      {
+        p_token_hash: tokenHash,
+        p_password_hash: passwordHash,
+      }
+    );
+    if (error) throw error;
+    if (!reset) {
+      return res.status(400).json({
+        error: 'This password reset link is invalid, expired, or already used.',
+      });
+    }
+
+    return res.json({ success: true, message: 'Password updated. You can now log in.' });
+  } catch (error) {
+    console.error('Password reset error:', error.message);
+    return res.status(500).json({ error: 'Unable to reset password' });
   }
 }
 
@@ -509,6 +662,8 @@ module.exports = {
   getProfile,
   updateProfile,
   changePassword,
+  requestPasswordReset,
+  resetPassword,
   logout,
   createStaff,
   publicUser,

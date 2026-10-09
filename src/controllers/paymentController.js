@@ -6,17 +6,21 @@ const { supabaseAdmin } = require('../config/supabase');
 const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
 const PAYSTACK_BASE = 'https://api.paystack.co';
 
+// ─── School bank account (from .env, with sensible fallbacks) ───
+const SCHOOL_BANK = {
+  bank_name: process.env.SCHOOL_BANK_NAME || 'Bank Name',
+  account_name: process.env.SCHOOL_ACCOUNT_NAME || 'Clan of David Art & Music Academy',
+  account_number: process.env.SCHOOL_ACCOUNT_NUMBER || '0000000000',
+};
+
 // Handles "url1,url2" in FRONTEND_URL — use the first one as the canonical frontend
 const FRONTEND_URL =
   (process.env.FRONTEND_URL || 'http://localhost:5173').split(',')[0].trim();
 
-// Backend URL is used so Paystack redirects to us first, then we forward to frontend.
-// Set BACKEND_URL in .env for production. Falls back to the incoming request's host.
 function resolveBackendUrl(req) {
   if (process.env.BACKEND_URL) {
     return process.env.BACKEND_URL.replace(/\/$/, '');
   }
-  // Derive from the current request (works in dev + on Vercel)
   const proto = req.headers['x-forwarded-proto'] || req.protocol || 'http';
   const host = req.headers['x-forwarded-host'] || req.get('host');
   return `${proto}://${host}`;
@@ -50,17 +54,16 @@ async function ensureStudent(userId, fallbackName) {
 
   const { data: created, error } = await supabaseAdmin
     .from('students')
-    .insert([{
-      user_id: userId,
-      student_id: `STU-${Date.now()}`,
-      full_name:
-        fallbackName ||
-        user?.full_name ||
-        user?.email?.split('@')[0] ||
-        null,
-      status: 'active',
-      created_at: new Date().toISOString(),
-    }])
+    .insert([
+      {
+        user_id: userId,
+        student_id: null,
+        full_name:
+          fallbackName || user?.full_name || user?.email?.split('@')[0] || null,
+        status: 'active',
+        created_at: new Date().toISOString(),
+      },
+    ])
     .select()
     .single();
 
@@ -71,10 +74,71 @@ async function ensureStudent(userId, fallbackName) {
   return created;
 }
 
+// Paystack disabled route (kept for compatibility)
+function bankTransferRequired(req, res) {
+  return res.status(410).json({
+    error:
+      'Online Paystack payments are disabled. Please use the school bank account shown in your payment details.',
+    paymentMethod: 'bank_transfer',
+    bank: SCHOOL_BANK,
+  });
+}
+
 // ============================================================
-// POST /api/payments/initialize
+// GET /api/payments/bank-details
+// Public-ish — returns the school bank account for manual transfers.
 // ============================================================
-async function initializePayment(req, res) {
+async function getBankDetails(req, res) {
+  try {
+    // Optionally pull a student's latest admission to attach context
+    const userId = req.user?.id;
+    let student = null;
+    let latestAdmission = null;
+
+    if (userId) {
+      student = await findStudent(userId);
+      if (student) {
+        const { data: admRows } = await supabaseAdmin
+          .from('admissions')
+          .select('id, status, course, track_name, created_at')
+          .eq('student_id', student.id)
+          .order('created_at', { ascending: false })
+          .limit(1);
+        latestAdmission = admRows?.[0] || null;
+      }
+    }
+
+    return res.json({
+      success: true,
+      bank: SCHOOL_BANK,
+      student: student
+        ? {
+            id: student.id,
+            full_name: student.full_name,
+            student_id: student.student_id,
+          }
+        : null,
+      admission: latestAdmission,
+    });
+  } catch (error) {
+    console.error('❌ getBankDetails error:', error.message);
+    return res.status(500).json({ error: 'Failed to fetch bank details' });
+  }
+}
+
+// ============================================================
+// POST /api/payments/bank-transfer
+// Student has manually transferred money to the school account and
+// submits proof of payment. We create a PENDING payment row that an
+// admin can later approve.
+//
+// Correct behaviour:
+//   ✅ Allows renewals — an "approved" admission no longer blocks
+//   ✅ Returns an existing PENDING transfer instead of erroring
+//   ✅ Allows resubmission if the last transfer was rejected/failed
+//   ❌ Only blocks when we can't figure out who the student is
+// ============================================================
+async function submitBankTransfer(req, res) {
   try {
     const userId = req.user?.id;
     if (!userId) {
@@ -83,12 +147,186 @@ async function initializePayment(req, res) {
 
     const {
       amount,
-      email,
-      course,
-      trackName,
       plan,
+      course,          // campus
+      trackName,
       studentName,
-    } = req.body;
+      reference,       // bank reference / teller number (optional)
+      transferDate,    // YYYY-MM-DD (optional)
+      proofUrl,        // uploaded receipt URL (optional)
+      notes,           // free-form note (optional)
+    } = req.body || {};
+
+    // ── Validate amount ──
+    const numericAmount = Number(amount);
+    if (!Number.isFinite(numericAmount) || numericAmount < 1) {
+      return res
+        .status(400)
+        .json({ error: 'A valid amount (₦1 or more) is required' });
+    }
+
+    // ── Ensure student ──
+    const student = await ensureStudent(userId, studentName);
+    if (!student) {
+      return res
+        .status(404)
+        .json({ error: 'Could not resolve your student record.' });
+    }
+
+    // ── Check for an existing PENDING bank transfer ──
+    // If one exists, return it instead of creating a duplicate.
+    const { data: pendingRows, error: pendingErr } = await supabaseAdmin
+      .from('payments')
+      .select(
+        'id, payment_id, reference, amount, plan, status, payment_date, created_at'
+      )
+      .eq('student_id', student.id)
+      .eq('payment_type', 'bank_transfer')
+      .eq('status', 'pending')
+      .order('created_at', { ascending: false })
+      .limit(1);
+
+    if (pendingErr) {
+      console.warn('⚠️ Could not check pending transfers:', pendingErr.message);
+    }
+
+    if (pendingRows && pendingRows.length > 0) {
+      // An identical pending submission — return it as-is
+      const sameAmount =
+        Math.abs(Number(pendingRows[0].amount) - numericAmount) < 0.5;
+
+      if (sameAmount) {
+        return res.json({
+          success: true,
+          existing: true,
+          message:
+            'You already have a pending bank transfer for this amount. We will notify you once it is approved.',
+          payment: pendingRows[0],
+          bank: SCHOOL_BANK,
+        });
+      }
+
+      // Different amount — student is likely paying for something else.
+      // Mark the old one as cancelled and create a fresh one below.
+      await supabaseAdmin
+        .from('payments')
+        .update({
+          status: 'cancelled',
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', pendingRows[0].id);
+    }
+
+    // ── Create the new pending bank transfer row ──
+    const now = new Date().toISOString();
+    const paymentId = `BT-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+    const internalReference =
+      reference?.trim() ||
+      `BT-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
+
+    const row = {
+      student_id: student.id,
+      payment_id: paymentId,
+      reference: internalReference,
+      amount: numericAmount,
+      currency: 'NGN',
+      plan: plan || 'termly',
+      course: course || null,
+      payment_type: 'bank_transfer',
+      description:
+        [course, trackName].filter(Boolean).join(' · ') ||
+        'School fees (bank transfer)',
+      status: 'pending',
+      created_at: now,
+      updated_at: now,
+      // Extra fields — safe to include even if the column doesn't exist,
+      // Supabase silently ignores unknown columns only if they're set to null.
+      // If your payments table doesn't have these, they'll just be dropped:
+      transfer_date: transferDate || null,
+      proof_url: proofUrl || null,
+      notes: notes || null,
+    };
+
+    const { data: payment, error: insertErr } = await supabaseAdmin
+      .from('payments')
+      .insert([row])
+      .select()
+      .single();
+
+    if (insertErr) {
+      // If specific columns don't exist, retry without them
+      console.warn(
+        '⚠️ Insert with extra columns failed, retrying minimal row:',
+        insertErr.message
+      );
+
+      const minimalRow = {
+        student_id: student.id,
+        payment_id: paymentId,
+        reference: internalReference,
+        amount: numericAmount,
+        currency: 'NGN',
+        plan: plan || 'termly',
+        course: course || null,
+        payment_type: 'bank_transfer',
+        description:
+          [course, trackName].filter(Boolean).join(' · ') ||
+          'School fees (bank transfer)',
+        status: 'pending',
+        created_at: now,
+      };
+
+      const { data: payment2, error: insertErr2 } = await supabaseAdmin
+        .from('payments')
+        .insert([minimalRow])
+        .select()
+        .single();
+
+      if (insertErr2) {
+        console.error('❌ submitBankTransfer insert error:', insertErr2.message);
+        return res.status(500).json({
+          error: 'Failed to save bank transfer',
+          details: insertErr2.message,
+        });
+      }
+
+      return res.status(201).json({
+        success: true,
+        message:
+          'Bank transfer submitted. An admin will verify and approve your payment.',
+        payment: payment2,
+        bank: SCHOOL_BANK,
+      });
+    }
+
+    return res.status(201).json({
+      success: true,
+      message:
+        'Bank transfer submitted. An admin will verify and approve your payment.',
+      payment,
+      bank: SCHOOL_BANK,
+    });
+  } catch (error) {
+    console.error('❌ submitBankTransfer error:', error.message);
+    return res.status(500).json({
+      error: 'Failed to submit bank transfer',
+      details: error.message,
+    });
+  }
+}
+
+// ============================================================
+// POST /api/payments/initialize (Paystack — currently disabled)
+// ============================================================
+async function initializePayment(req, res) {
+  try {
+    const userId = req.user?.id;
+    if (!userId) {
+      return res.status(401).json({ error: 'Authentication required' });
+    }
+
+    const { amount, email, course, trackName, plan, studentName } =
+      req.body;
 
     if (!amount || !email) {
       return res.status(400).json({ error: 'Amount and email are required' });
@@ -101,9 +339,6 @@ async function initializePayment(req, res) {
 
     const student = await ensureStudent(userId, studentName);
 
-    // ── Callback URL must be the BACKEND verify endpoint ──
-    // Paystack will append ?reference=xxx automatically.
-    // After verifying, our verifyPayment() redirects the browser to the frontend.
     const backendUrl = resolveBackendUrl(req);
     const callbackUrl = `${backendUrl}/api/payments/verify`;
 
@@ -155,24 +390,24 @@ async function initializePayment(req, res) {
 
     const paymentId = `PAY-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
 
-    // ── Save pending payment ──
-    // `course` is the CAMPUS (e.g. "Lugbe Campus") — stored in its own column
-    // so we can pre-fill it on future renewals.
     const { data: payment, error: insertErr } = await supabaseAdmin
       .from('payments')
-      .insert([{
-        student_id: student.id,
-        payment_id: paymentId,
-        reference,
-        amount: Number(amount),
-        currency: 'NGN',
-        plan: plan || 'termly',
-        course: course || null,                       // ← ADDED
-        payment_type: 'school_fees',
-        description: [course, trackName].filter(Boolean).join(' · ') || null,
-        status: 'pending',
-        created_at: new Date().toISOString(),
-      }])
+      .insert([
+        {
+          student_id: student.id,
+          payment_id: paymentId,
+          reference,
+          amount: Number(amount),
+          currency: 'NGN',
+          plan: plan || 'termly',
+          course: course || null,
+          payment_type: 'school_fees',
+          description:
+            [course, trackName].filter(Boolean).join(' · ') || null,
+          status: 'pending',
+          created_at: new Date().toISOString(),
+        },
+      ])
       .select()
       .single();
 
@@ -200,8 +435,6 @@ async function initializePayment(req, res) {
 
 // ============================================================
 // GET /api/payments/verify?reference=xxx
-// Paystack redirects the browser here after a payment.
-// We verify with Paystack, update our DB, then redirect to the frontend.
 // ============================================================
 async function verifyPayment(req, res) {
   try {
@@ -249,7 +482,6 @@ async function verifyPayment(req, res) {
       }
     }
 
-    // ── Send the browser back to the frontend
     const redirectPath = isSuccessful
       ? `/login?registered=true&reference=${encodeURIComponent(reference)}`
       : `/payment/failed?reference=${encodeURIComponent(reference)}`;
@@ -259,7 +491,9 @@ async function verifyPayment(req, res) {
     const detail = error.response?.data?.message || error.message;
     console.error('❌ verifyPayment error:', detail);
     return res.redirect(
-      `${FRONTEND_URL}/login?error=verification_error&reference=${encodeURIComponent(req.query.reference || '')}`
+      `${FRONTEND_URL}/login?error=verification_error&reference=${encodeURIComponent(
+        req.query.reference || ''
+      )}`
     );
   }
 }
@@ -333,18 +567,22 @@ async function createInvoice(studentId, paymentRow) {
 
     const invoiceNumber = `INV-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
 
-    await supabaseAdmin.from('invoices').insert([{
-      student_id: studentId,
-      payment_id: paymentRow.payment_id,
-      invoice_number: invoiceNumber,
-      amount: paymentRow.amount,
-      status: 'paid',
-      items: [{
-        description: paymentRow.description || 'Programme fee',
+    await supabaseAdmin.from('invoices').insert([
+      {
+        student_id: studentId,
+        payment_id: paymentRow.payment_id,
+        invoice_number: invoiceNumber,
         amount: paymentRow.amount,
-      }],
-      created_at: new Date().toISOString(),
-    }]);
+        status: 'paid',
+        items: [
+          {
+            description: paymentRow.description || 'Programme fee',
+            amount: paymentRow.amount,
+          },
+        ],
+        created_at: new Date().toISOString(),
+      },
+    ]);
   } catch (err) {
     console.error('⚠️ createInvoice failed:', err.message);
   }
@@ -404,7 +642,13 @@ async function getInvoices(req, res) {
   }
 }
 
+// ============================================================
+// EXPORTS
+// ============================================================
 module.exports = {
+  bankTransferRequired,
+  getBankDetails,
+  submitBankTransfer,
   initializePayment,
   verifyPayment,
   paystackWebhook,

@@ -2,6 +2,23 @@
 const { supabaseAdmin } = require('../config/supabase');
 const supabaseService = require('../services/supabaseService');
 
+const SCHOOL_BANK_ACCOUNT = {
+  bankName: 'Zenith Bank',
+  accountNumber: '1219258176',
+  accountName: 'Clan of David Music',
+};
+
+function getAdmissionFeeAmount(admission) {
+  const amount =
+    admission?.amount_due ??
+    admission?.fee_amount ??
+    process.env.ADMISSION_FEE_AMOUNT;
+  const parsedAmount = Number(amount);
+  return Number.isFinite(parsedAmount) && parsedAmount >= 0 && amount !== ''
+    ? parsedAmount
+    : null;
+}
+
 // ============ HELPERS ============
 async function findStudent(userId) {
   const { data, error } = await supabaseAdmin
@@ -31,7 +48,7 @@ async function ensureStudent(req) {
     .insert([
       {
         user_id: userId,
-        student_id: `STU-${Date.now()}`,
+        student_id: null,
         full_name: user?.full_name || user?.email?.split('@')[0] || null,
         email: user?.email || null,
         status: 'active',
@@ -119,6 +136,92 @@ async function getMyEnrolledClasses(req, res) {
   }
 }
 
+async function getMyIdCardRequest(req, res) {
+  try {
+    const student = await findStudent(req.user.id);
+    if (!student) return res.status(404).json({ error: 'Student record not found' });
+
+    const { data: requests, error } = await supabaseAdmin
+      .from('id_card_requests')
+      .select('id, status, submitted_at, reviewed_at, admin_note, created_at')
+      .eq('student_id', student.id)
+      .order('created_at', { ascending: false })
+      .limit(1);
+    if (error) throw error;
+
+    const { data: admissions, error: admissionError } = await supabaseAdmin
+      .from('admissions')
+      .select('status')
+      .eq('student_id', student.id)
+      .order('created_at', { ascending: false })
+      .limit(1);
+    if (admissionError) throw admissionError;
+    const latestRequest = requests?.[0] || null;
+    const hasApprovedAdmission = admissions?.[0]?.status === 'approved';
+
+    return res.json({
+      success: true,
+      studentId: student.student_id || null,
+      request: latestRequest,
+      canApply: hasApprovedAdmission && latestRequest?.status !== 'pending',
+    });
+  } catch (error) {
+    console.error('Get ID-card request error:', error.message);
+    if (error.code === 'PGRST205' || /id_card_requests.*schema cache/i.test(error.message || '')) {
+      return res.status(503).json({
+        error: 'ID-card request storage is not enabled. Apply the student ID-card Supabase migration.',
+        code: 'ID_CARD_SCHEMA_MISSING',
+      });
+    }
+    return res.status(500).json({ error: 'Failed to fetch ID-card request' });
+  }
+}
+
+async function submitIdCardRequest(req, res) {
+  try {
+    const student = await findStudent(req.user.id);
+    if (!student) return res.status(404).json({ error: 'Student record not found' });
+
+    const { data: admissions, error: admissionError } = await supabaseAdmin
+      .from('admissions')
+      .select('status')
+      .eq('student_id', student.id)
+      .order('created_at', { ascending: false })
+      .limit(1);
+    if (admissionError) throw admissionError;
+    if (admissions?.[0]?.status !== 'approved') {
+      return res.status(403).json({ error: 'An approved admission is required to apply for an ID card' });
+    }
+
+    const { data: request, error } = await supabaseAdmin
+      .from('id_card_requests')
+      .insert({ student_id: student.id, status: 'pending' })
+      .select()
+      .single();
+    if (error) {
+      if (error.code === '23505') {
+        return res.status(409).json({ error: 'You already have a pending ID-card request' });
+      }
+      throw error;
+    }
+
+    return res.status(201).json({
+      success: true,
+      message: 'ID-card request submitted for admin review',
+      request,
+    });
+  } catch (error) {
+    console.error('Submit ID-card request error:', error.message);
+    if (error.code === 'PGRST205' || /id_card_requests.*schema cache/i.test(error.message || '')) {
+      return res.status(503).json({
+        error: 'ID-card request storage is not enabled. Apply the student ID-card Supabase migration.',
+        code: 'ID_CARD_SCHEMA_MISSING',
+      });
+    }
+    return res.status(500).json({ error: 'Failed to submit ID-card request' });
+  }
+}
+
 // ============ PROFILE ============
 async function getProfile(req, res) {
   try {
@@ -136,7 +239,20 @@ async function getProfile(req, res) {
     if (error) throw error;
     delete user.password_hash;
 
-    res.json({ user, student: studentRows?.[0] || null });
+    const student = studentRows?.[0] || null;
+    let idCardRequest = null;
+    if (student) {
+      const { data: requests, error: requestError } = await supabaseAdmin
+        .from('id_card_requests')
+        .select('id, status, submitted_at, reviewed_at, admin_note')
+        .eq('student_id', student.id)
+        .order('created_at', { ascending: false })
+        .limit(1);
+      if (requestError) throw requestError;
+      idCardRequest = requests?.[0] || null;
+    }
+
+    res.json({ user, student, idCardRequest });
   } catch (error) {
     console.error('Get profile error:', error);
     res
@@ -711,15 +827,15 @@ async function getPaymentContext(req, res) {
       return res.json({ success: true, context: null, reason: 'no_admission' });
     }
 
-    let email = student.email || null;
-    if (!email) {
-      const { data: userRows } = await supabaseAdmin
-        .from('users')
-        .select('email')
-        .eq('id', userId)
-        .limit(1);
-      email = userRows?.[0]?.email || null;
-    }
+    const { data: userRows, error: userError } = await supabaseAdmin
+      .from('users')
+      .select('email, full_name, phone')
+      .eq('id', userId)
+      .limit(1);
+    if (userError) throw userError;
+    const user = userRows?.[0] || {};
+    const email = student.email || user.email || adm.guardian_email || null;
+    const amountDue = getAdmissionFeeAmount(adm);
 
     return res.json({
       success: true,
@@ -728,8 +844,19 @@ async function getPaymentContext(req, res) {
         trackName: adm.track_name || null,
         formData: adm.form_data || adm.formData || {},
         applicationId: adm.id,
-        studentName: student.full_name || null,
+        admissionNumber: adm.admission_number || null,
+        admissionStatus: adm.status || 'pending',
+        studentName: adm.student_name || student.full_name || user.full_name || null,
         email,
+        student: {
+          studentId: student.student_id || null,
+          fullName: adm.student_name || student.full_name || user.full_name || null,
+          email,
+          phone: user.phone || adm.guardian_phone || null,
+        },
+        amountDue,
+        currency: 'NGN',
+        bankAccount: SCHOOL_BANK_ACCOUNT,
       },
     });
   } catch (error) {
@@ -747,7 +874,7 @@ async function getMyFees(req, res) {
 
     const { data: student } = await supabaseAdmin
       .from('students')
-      .select('id')
+      .select('id, student_id, full_name, email')
       .eq('user_id', userId)
       .maybeSingle();
 
@@ -755,9 +882,11 @@ async function getMyFees(req, res) {
       return res.json({
         success: true,
         fees: null,
+        pending: null,
         payments: [],
         totalPaid: 0,
         totalPending: 0,
+        paymentDetails: null,
       });
     }
 
@@ -769,15 +898,43 @@ async function getMyFees(req, res) {
 
     if (error) throw error;
 
+    const { data: admissions, error: admissionError } = await supabaseAdmin
+      .from('admissions')
+      .select('*')
+      .eq('student_id', student.id)
+      .order('created_at', { ascending: false })
+      .limit(1);
+    if (admissionError) throw admissionError;
+
+    const admission = admissions?.[0] || null;
+    const { data: userRows, error: userError } = await supabaseAdmin
+      .from('users')
+      .select('email, full_name, phone')
+      .eq('id', userId)
+      .limit(1);
+    if (userError) throw userError;
+    const user = userRows?.[0] || {};
+
     const list = payments || [];
     const latest = list.find((p) => p.status === 'completed');
+
+    // ── NEW: find the latest PENDING payment (bank transfer or otherwise) ──
+    const pendingPayment = list.find((p) => p.status === 'pending');
 
     let fees = null;
     if (latest) {
       const paidDate = new Date(latest.payment_date || latest.created_at);
       const plan = (latest.plan || 'monthly').toLowerCase();
-      const planDays =
-        plan === 'termly' ? 90 : plan === 'monthly' ? 30 : plan === 'daily' ? 1 : 30;
+      const storedDurationDays = Number(latest.duration_days);
+      const planDays = Number.isInteger(storedDurationDays) && storedDurationDays > 0
+        ? storedDurationDays
+        : plan === 'termly'
+        ? 90
+        : plan === 'monthly'
+        ? 30
+        : plan === 'daily'
+        ? 1
+        : 30;
 
       const expiresAt = new Date(paidDate);
       expiresAt.setDate(expiresAt.getDate() + planDays);
@@ -799,7 +956,7 @@ async function getMyFees(req, res) {
             ? 'Monthly'
             : plan === 'daily'
             ? 'Daily'
-            : 'Monthly',
+            : `${planDays} days`,
         amount: Number(latest.amount || 0),
         paidAt: paidDate.toISOString(),
         expiresAt: expiresAt.toISOString(),
@@ -819,6 +976,31 @@ async function getMyFees(req, res) {
       };
     }
 
+    // ── NEW: build the pending payment object ──
+    const pending = pendingPayment
+      ? {
+          id: pendingPayment.id,
+          payment_id: pendingPayment.payment_id,
+          reference: pendingPayment.reference || null,
+          amount: Number(pendingPayment.amount || 0),
+          plan: pendingPayment.plan || 'termly',
+          planLabel:
+            (pendingPayment.plan || 'termly').toLowerCase() === 'termly'
+              ? 'Termly (3 months)'
+              : (pendingPayment.plan || 'monthly').toLowerCase() === 'monthly'
+              ? 'Monthly'
+              : (pendingPayment.plan || 'daily').toLowerCase() === 'daily'
+              ? 'Daily'
+              : 'Payment',
+          status: 'pending',
+          payment_type: pendingPayment.payment_type || null,
+          description: pendingPayment.description || null,
+          course: pendingPayment.course || null,
+          created_at: pendingPayment.created_at,
+          submittedAt: pendingPayment.created_at,
+        }
+      : null;
+
     const totalPaid = list
       .filter((p) => p.status === 'completed')
       .reduce((s, p) => s + Number(p.amount || 0), 0);
@@ -829,9 +1011,26 @@ async function getMyFees(req, res) {
     return res.json({
       success: true,
       fees,
+      pending, // ← NEW: latest pending payment (or null)
       totalPaid,
       totalPending,
       payments: list,
+      paymentDetails: admission
+        ? {
+            applicationId: admission.id,
+            admissionNumber: admission.admission_number || null,
+            admissionStatus: admission.status || 'pending',
+            student: {
+              studentId: student.student_id || null,
+              fullName: admission.student_name || student.full_name || user.full_name || null,
+              email: student.email || user.email || admission.guardian_email || null,
+              phone: user.phone || admission.guardian_phone || null,
+            },
+            amountDue: getAdmissionFeeAmount(admission),
+            currency: 'NGN',
+            bankAccount: SCHOOL_BANK_ACCOUNT,
+          }
+        : null,
     });
   } catch (error) {
     console.error('❌ getMyFees error:', error.message);
@@ -1401,6 +1600,8 @@ module.exports = {
   getCourseDetails,
   getMyProgramme,
   getMyEnrolledClasses,
+  getMyIdCardRequest,
+  submitIdCardRequest,
   getAssignments,
   getAssignmentDetails,
   submitAssignment,

@@ -14,6 +14,8 @@ router.put('/profile', authenticateToken, studentController.updateProfile);
 // ─── My programme & classes ───
 router.get('/my-programme', authenticateToken, studentController.getMyProgramme);
 router.get('/my-classes', authenticateToken, studentController.getMyEnrolledClasses);
+router.get('/id-card-request', authenticateToken, studentController.getMyIdCardRequest);
+router.post('/id-card-request', authenticateToken, studentController.submitIdCardRequest);
 
 // ─── Attendance ───
 router.get('/attendance', authenticateToken, studentController.getMyAttendance);

@@ -1,5 +1,6 @@
 // src/controllers/adminController.js
 const { supabaseAdmin } = require('../config/supabase');
+const { sendMail } = require('../services/emailService');
 
 let bcrypt = null;
 try {
@@ -10,12 +11,85 @@ try {
   } catch {
     console.warn(
       '⚠️ bcrypt/bcryptjs not installed — reset passwords will be saved ' +
-        'as plaintext only and won\'t be usable for login.'
+        "as plaintext only and won't be usable for login."
     );
   }
 }
 
 const BCRYPT_ROUNDS = 10;
+
+function isMusicAdmission(trackName, instrument) {
+  return /music|instrument/i.test(String(trackName || '')) || Boolean(instrument);
+}
+
+function resolvePaymentDuration(body = {}) {
+  const rawDuration =
+    body.durationDays ??
+    body.duration_days ??
+    body.duration ??
+    body.plan;
+  if (rawDuration === undefined || rawDuration === null || rawDuration === '') return null;
+
+  const value = String(rawDuration).trim().toLowerCase();
+  const presets = {
+    daily: { plan: 'daily', durationDays: 1 },
+    day: { plan: 'daily', durationDays: 1 },
+    monthly: { plan: 'monthly', durationDays: 30 },
+    month: { plan: 'monthly', durationDays: 30 },
+    termly: { plan: 'termly', durationDays: 90 },
+    term: { plan: 'termly', durationDays: 90 },
+    quarterly: { plan: 'termly', durationDays: 90 },
+    yearly: { plan: 'custom', durationDays: 365 },
+    annually: { plan: 'custom', durationDays: 365 },
+    annual: { plan: 'custom', durationDays: 365 },
+  };
+  if (presets[value]) return presets[value];
+
+  const match = value.match(/^(\d+)\s*(days?|d|weeks?|w|months?|mo|years?|y)?$/);
+  if (!match) return null;
+
+  const quantity = Number(match[1]);
+  const unit = match[2] || 'days';
+  const multiplier = /^(w|week)/.test(unit)
+    ? 7
+    : /^(mo|month)/.test(unit)
+    ? 30
+    : /^(y|year)/.test(unit)
+    ? 365
+    : 1;
+  const durationDays = quantity * multiplier;
+  if (!Number.isInteger(durationDays) || durationDays < 1 || durationDays > 3650) return null;
+
+  const plan = durationDays === 1
+    ? 'daily'
+    : durationDays === 30
+    ? 'monthly'
+    : durationDays === 90
+    ? 'termly'
+    : 'custom';
+  return { plan, durationDays };
+}
+
+function formatAdminPayment(payment) {
+  const isPaid = payment.status === 'completed';
+  const paidAt = isPaid
+    ? payment.payment_date || payment.created_at || null
+    : payment.payment_date || null;
+  const paidMonth = paidAt && !Number.isNaN(new Date(paidAt).getTime())
+    ? new Intl.DateTimeFormat('en-NG', {
+        month: 'long',
+        year: 'numeric',
+        timeZone: 'UTC',
+      }).format(new Date(paidAt))
+    : null;
+
+  return {
+    ...payment,
+    paid_at: paidAt,
+    payment_month: paidMonth,
+    paymentMonth: paidMonth,
+  };
+}
 
 function generateTempPassword() {
   const words = [
@@ -35,7 +109,7 @@ function generateTempPassword() {
 // Notify matching students when a teacher is assigned.
 // ─────────────────────────────────────────────────────────────
 async function notifyStudentsOfStaffAssignment({
-  staffId,          // ← NEW: needed for the deep-link
+  staffId,
   staffName,
   category,
   levels,
@@ -101,7 +175,7 @@ async function notifyStudentsOfStaffAssignment({
     title: `New teacher assigned: ${staffName}`,
     message: `${staffName} has been assigned as your teacher for ${levelText}. You can now message them directly.`,
     type: 'teacher_assigned',
-    link: staffId ? `/student/messages?teacher=${staffId}` : '/student/messages',  // ← CHANGED
+    link: staffId ? `/student/messages?teacher=${staffId}` : '/student/messages',
   }));
 
   try {
@@ -146,7 +220,7 @@ class AdminController {
       const students = rows || [];
       const ids = students.map((s) => s.id);
 
-      let payMap = {};
+      const paymentHistoryMap = {};
       let admMap = {};
       let classMap = {};
       let rcMap = {};
@@ -155,7 +229,7 @@ class AdminController {
         const [payRes, admRes, scRes, rcRes] = await Promise.all([
           supabaseAdmin
             .from('payments')
-            .select('student_id, amount, status, description, plan, payment_date, created_at')
+            .select('id, student_id, payment_id, reference, amount, currency, status, payment_type, description, plan, duration_days, payment_date, created_at')
             .in('student_id', ids)
             .order('created_at', { ascending: false }),
           supabaseAdmin
@@ -181,7 +255,8 @@ class AdminController {
         ]);
 
         (payRes.data || []).forEach((p) => {
-          if (!payMap[p.student_id]) payMap[p.student_id] = p;
+          paymentHistoryMap[p.student_id] = paymentHistoryMap[p.student_id] || [];
+          paymentHistoryMap[p.student_id].push(formatAdminPayment(p));
         });
         (admRes.data || []).forEach((a) => {
           if (!admMap[a.student_id]) admMap[a.student_id] = a;
@@ -198,7 +273,12 @@ class AdminController {
       }
 
       let combined = students.map((s) => {
-        const pay = payMap[s.id];
+        const paymentHistory = paymentHistoryMap[s.id] || [];
+        const mostRecentPayment = paymentHistory[0] || null;
+        const mostRecentPaidPayment = paymentHistory.find((payment) => payment.status === 'completed') || null;
+        const totalPaid = paymentHistory
+          .filter((payment) => payment.status === 'completed')
+          .reduce((sum, payment) => sum + Number(payment.amount || 0), 0);
         const adm = admMap[s.id];
         const classes = classMap[s.id] || [];
         const rc = rcMap[s.id] || { total: 0, submitted: 0 };
@@ -224,11 +304,18 @@ class AdminController {
           created_at: s.created_at,
           programme: adm?.course
             ? `${adm.course} · ${adm.track_name || ''}`.trim()
-            : pay?.description || null,
-          payment_status: pay?.status || 'none',
-          payment_amount: pay?.amount || 0,
-          payment_plan: pay?.plan || null,
-          payment_date: pay?.payment_date || pay?.created_at || null,
+            : mostRecentPayment?.description || null,
+          payment_status: mostRecentPayment?.status || 'none',
+          latest_payment_status: mostRecentPayment?.status || 'none',
+          payment_amount: Number(mostRecentPaidPayment?.amount || 0),
+          amount_paid: Number(mostRecentPaidPayment?.amount || 0),
+          payment_plan: mostRecentPaidPayment?.plan || null,
+          payment_date: mostRecentPaidPayment?.paid_at || null,
+          payment_month: mostRecentPaidPayment?.payment_month || null,
+          paymentMonth: mostRecentPaidPayment?.payment_month || null,
+          total_paid: totalPaid,
+          payments: paymentHistory,
+          payment_history: paymentHistory,
           classes: classes.map((c) => ({
             id: c.id,
             title: c.title || c.subject,
@@ -286,7 +373,7 @@ class AdminController {
       const student = rows?.[0];
       if (!student) return res.status(404).json({ error: 'Student not found' });
 
-      const [paymentsRes, admissionsRes, reportCardsRes, invoicesRes, classesRes] =
+      const [paymentsRes, admissionsRes, reportCardsRes, invoicesRes, classesRes, idCardRequestsRes] =
         await Promise.all([
           supabaseAdmin
             .from('payments')
@@ -319,18 +406,36 @@ class AdminController {
             )
             .eq('student_id', studentId)
             .eq('status', 'active'),
+          supabaseAdmin
+            .from('id_card_requests')
+            .select('*')
+            .eq('student_id', studentId)
+            .order('created_at', { ascending: false }),
         ]);
 
       if (student.user) delete student.user.password_hash;
 
+      const payments = (paymentsRes.data || []).map(formatAdminPayment);
+      const completedPayments = payments.filter((payment) => payment.status === 'completed');
+      const totalPaid = completedPayments.reduce(
+        (sum, payment) => sum + Number(payment.amount || 0),
+        0
+      );
+
       res.json({
         success: true,
         student,
-        payments: paymentsRes.data || [],
+        payments,
+        paymentSummary: {
+          totalPaid,
+          completedCount: completedPayments.length,
+          latestPaidPayment: completedPayments[0] || null,
+        },
         admissions: admissionsRes.data || [],
         reportCards: reportCardsRes.data || [],
         invoices: invoicesRes.data || [],
         classes: (classesRes.data || []).map((r) => r.class).filter(Boolean),
+        idCardRequests: idCardRequestsRes.data || [],
       });
     } catch (error) {
       console.error('❌ Get student details error:', error.message);
@@ -341,15 +446,368 @@ class AdminController {
     }
   }
 
+  async getIdCardRequests(req, res) {
+    try {
+      const status = req.query.status || 'pending';
+      const { data: requests, error } = await supabaseAdmin
+        .from('id_card_requests')
+        .select('*')
+        .eq('status', status)
+        .order('submitted_at', { ascending: false });
+      if (error) throw error;
+
+      const studentIds = [...new Set((requests || []).map((request) => request.student_id))];
+      let studentsById = {};
+      let admissionsByStudentId = {};
+      if (studentIds.length) {
+        const [studentsResult, admissionsResult] = await Promise.all([
+          supabaseAdmin
+            .from('students')
+            .select('id, user_id, student_id, full_name, email, academic_year, user:users(id, email, phone)')
+            .in('id', studentIds),
+          supabaseAdmin
+            .from('admissions')
+            .select('student_id, course, track_name, instrument, academic_year, status, created_at')
+            .in('student_id', studentIds)
+            .order('created_at', { ascending: false }),
+        ]);
+        if (studentsResult.error) throw studentsResult.error;
+        if (admissionsResult.error) throw admissionsResult.error;
+        const students = studentsResult.data;
+        studentsById = Object.fromEntries((students || []).map((student) => [student.id, student]));
+        (admissionsResult.data || []).forEach((admission) => {
+          if (!admissionsByStudentId[admission.student_id]) {
+            admissionsByStudentId[admission.student_id] = admission;
+          }
+        });
+      }
+
+      res.json({
+        success: true,
+        requests: (requests || []).map((request) => ({
+          ...request,
+          student: studentsById[request.student_id] || null,
+          admission: admissionsByStudentId[request.student_id] || null,
+        })),
+      });
+    } catch (error) {
+      console.error('Get ID-card requests error:', error.message);
+      if (error.code === 'PGRST205' || /id_card_requests.*schema cache/i.test(error.message || '')) {
+        return res.status(503).json({
+          error: 'ID-card request storage is not enabled. Apply backend/supabase/migrations/202610090002_student_id_cards.sql in Supabase.',
+          code: 'ID_CARD_SCHEMA_MISSING',
+        });
+      }
+      res.status(500).json({ error: 'Failed to fetch ID-card requests' });
+    }
+  }
+
+  // ─── NEW: per-student ID-card requests ───
+  // GET /api/admin/students/:studentId/id-card-requests
+  async getStudentIdCardRequests(req, res) {
+    try {
+      const { studentId } = req.params;
+
+      const { data: requests, error } = await supabaseAdmin
+        .from('id_card_requests')
+        .select('*')
+        .eq('student_id', studentId)
+        .order('created_at', { ascending: false });
+      if (error) throw error;
+
+      const { data: studentRows } = await supabaseAdmin
+        .from('students')
+        .select('id, user_id, student_id, full_name, email, academic_year')
+        .eq('id', studentId)
+        .maybeSingle();
+
+      return res.json({
+        success: true,
+        studentId,
+        student: studentRows || null,
+        requests: requests || [],
+        latest: (requests || [])[0] || null,
+      });
+    } catch (error) {
+      console.error('Get student ID-card requests error:', error.message);
+      if (
+        error.code === 'PGRST205' ||
+        /id_card_requests.*schema cache/i.test(error.message || '')
+      ) {
+        return res.status(503).json({
+          error:
+            'ID-card request storage is not enabled. Apply the student ID-card migration.',
+          code: 'ID_CARD_SCHEMA_MISSING',
+        });
+      }
+      return res
+        .status(500)
+        .json({ error: 'Failed to fetch student ID-card requests' });
+    }
+  }
+
+  async approveIdCardRequest(req, res) {
+    try {
+      const { requestId } = req.params;
+      const { data: pendingRequest, error: requestError } = await supabaseAdmin
+        .from('id_card_requests')
+        .select('student_id')
+        .eq('id', requestId)
+        .maybeSingle();
+      if (requestError) throw requestError;
+      if (!pendingRequest) return res.status(404).json({ error: 'ID-card request not found' });
+
+      const { data: previousStudent, error: previousStudentError } = await supabaseAdmin
+        .from('students')
+        .select('student_id')
+        .eq('id', pendingRequest.student_id)
+        .maybeSingle();
+      if (previousStudentError) throw previousStudentError;
+
+      const { data, error } = await supabaseAdmin.rpc('approve_student_id_card_request', {
+        p_request_id: requestId,
+        p_admin_id: req.user.id,
+      });
+      if (error) {
+        if (/not pending|not found/i.test(error.message)) {
+          return res.status(409).json({ error: error.message });
+        }
+        throw error;
+      }
+
+      const result = Array.isArray(data) ? data[0] : data;
+      const { data: student, error: studentError } = await supabaseAdmin
+        .from('students')
+        .select('id, student_id, user_id, full_name')
+        .eq('id', result.student_id)
+        .maybeSingle();
+      if (studentError) throw studentError;
+
+      if (previousStudent?.student_id !== student.student_id) {
+        try {
+          const notificationController = require('./notificationController');
+          await notificationController.pushNotification({
+            studentId: student.id,
+            title: 'Student ID assigned',
+            message: `Your student ID is ${student.student_id}. Your ID-card request has been approved.`,
+            type: 'student_id_updated',
+            link: '/student/profile',
+          });
+        } catch (notificationError) {
+          console.warn('ID-card approval notification failed:', notificationError.message);
+        }
+      }
+
+      return res.json({
+        success: true,
+        message: 'ID-card request approved and student ID generated',
+        request: result,
+        student,
+      });
+    } catch (error) {
+      console.error('Approve ID-card request error:', error.message);
+      return res.status(500).json({ error: 'Failed to approve ID-card request' });
+    }
+  }
+
+  // ─── NEW: per-student ID-card approval ───
+  // POST /api/admin/students/:studentId/id-card-requests/:requestId/approve
+  async approveStudentIdCardRequest(req, res) {
+    try {
+      const { studentId, requestId } = req.params;
+      const { studentType } = req.body || {};
+
+      // 1. Load the request and confirm it belongs to this student
+      const { data: request, error: reqErr } = await supabaseAdmin
+        .from('id_card_requests')
+        .select('id, student_id, status')
+        .eq('id', requestId)
+        .maybeSingle();
+      if (reqErr) throw reqErr;
+      if (!request) return res.status(404).json({ error: 'ID-card request not found' });
+      if (String(request.student_id) !== String(studentId)) {
+        return res
+          .status(403)
+          .json({ error: 'Request does not belong to this student' });
+      }
+      if (request.status !== 'pending') {
+        return res
+          .status(409)
+          .json({ error: 'ID-card request is not pending' });
+      }
+
+      // 2. Load student to check current ID
+      const { data: studentRow, error: stuErr } = await supabaseAdmin
+        .from('students')
+        .select('id, user_id, student_id, full_name, email')
+        .eq('id', studentId)
+        .maybeSingle();
+      if (stuErr) throw stuErr;
+      if (!studentRow) {
+        return res.status(404).json({ error: 'Student not found' });
+      }
+
+      // 3. Decide the ID format based on studentType or admission track
+      let resolvedType = String(studentType || '').toLowerCase();
+      if (!['regular', 'music'].includes(resolvedType)) {
+        const { data: admRow } = await supabaseAdmin
+          .from('admissions')
+          .select('track_name, instrument')
+          .eq('student_id', studentId)
+          .order('created_at', { ascending: false })
+          .limit(1)
+          .maybeSingle();
+        resolvedType = isMusicAdmission(admRow?.track_name, admRow?.instrument)
+          ? 'music'
+          : 'regular';
+      }
+
+      // 4. Generate the student ID if one isn't set yet
+      let generatedStudentId = studentRow.student_id;
+      if (!generatedStudentId) {
+        const year = new Date().getFullYear();
+        const seq = String(Date.now()).slice(-5);
+        generatedStudentId =
+          resolvedType === 'music'
+            ? `COD-${year}-${seq}`
+            : `COD-${year - 1}/${year}-${seq}`;
+
+        const { error: updErr } = await supabaseAdmin
+          .from('students')
+          .update({
+            student_id: generatedStudentId,
+            updated_at: new Date().toISOString(),
+          })
+          .eq('id', studentId);
+        if (updErr) throw updErr;
+      }
+
+      // 5. Mark the request approved
+      const now = new Date().toISOString();
+      const { data: updatedRequest, error: updateErr } = await supabaseAdmin
+        .from('id_card_requests')
+        .update({
+          status: 'approved',
+          reviewed_at: now,
+          reviewed_by: req.user?.id || null,
+          updated_at: now,
+        })
+        .eq('id', requestId)
+        .select()
+        .maybeSingle();
+      if (updateErr) throw updateErr;
+
+      // 6. Notify the student
+      try {
+        const notificationController = require('./notificationController');
+        await notificationController.pushNotification({
+          studentId,
+          title: 'Student ID assigned',
+          message: `Your student ID is ${generatedStudentId}. Your ID-card request has been approved.`,
+          type: 'student_id_updated',
+          link: '/student/profile',
+        });
+      } catch (notificationError) {
+        console.warn(
+          'ID-card approval notification failed:',
+          notificationError.message
+        );
+      }
+
+      return res.json({
+        success: true,
+        message: 'ID-card request approved',
+        request: updatedRequest,
+        studentId: generatedStudentId,
+        studentType: resolvedType,
+      });
+    } catch (error) {
+      console.error('Approve student ID-card request error:', error.message);
+      return res
+        .status(500)
+        .json({ error: 'Failed to approve student ID-card request' });
+    }
+  }
+
+  async rejectIdCardRequest(req, res) {
+    try {
+      const { requestId } = req.params;
+      const { adminNote } = req.body || {};
+      const { data: request, error } = await supabaseAdmin
+        .from('id_card_requests')
+        .update({
+          status: 'rejected',
+          admin_note: adminNote || null,
+          reviewed_at: new Date().toISOString(),
+          reviewed_by: req.user.id,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', requestId)
+        .eq('status', 'pending')
+        .select()
+        .maybeSingle();
+      if (error) throw error;
+      if (!request) return res.status(409).json({ error: 'ID-card request not found or is no longer pending' });
+
+      try {
+        const notificationController = require('./notificationController');
+        await notificationController.pushNotification({
+          studentId: request.student_id,
+          title: 'ID-card request needs attention',
+          message: adminNote || 'Your ID-card request was not approved. Please contact the school admin.',
+          type: 'id_card_request',
+          link: '/student/profile',
+        });
+      } catch (notificationError) {
+        console.warn('ID-card rejection notification failed:', notificationError.message);
+      }
+
+      return res.json({ success: true, request });
+    } catch (error) {
+      console.error('Reject ID-card request error:', error.message);
+      return res.status(500).json({ error: 'Failed to reject ID-card request' });
+    }
+  }
+
   async updateStudent(req, res) {
     try {
       const { studentId } = req.params;
       const { fullName, email, phone, status, academic_year } = req.body;
+      const requestedStudentId = req.body.studentIdNumber ?? req.body.student_id;
+      const { data: existingStudent, error: existingStudentError } = await supabaseAdmin
+        .from('students')
+        .select('id, user_id, student_id')
+        .eq('id', studentId)
+        .maybeSingle();
+      if (existingStudentError) throw existingStudentError;
+      if (!existingStudent) return res.status(404).json({ error: 'Student not found' });
 
       const sUpdates = {};
       if (fullName !== undefined) sUpdates.full_name = fullName.trim();
       if (status !== undefined) sUpdates.status = status;
       if (academic_year !== undefined) sUpdates.academic_year = academic_year;
+      if (requestedStudentId !== undefined) {
+        const newStudentId = String(requestedStudentId).trim();
+        const { data: admissions, error: admissionError } = await supabaseAdmin
+          .from('admissions')
+          .select('track_name, instrument')
+          .eq('student_id', studentId)
+          .order('created_at', { ascending: false })
+          .limit(1);
+        if (admissionError) throw admissionError;
+        const isMusic = isMusicAdmission(admissions?.[0]?.track_name, admissions?.[0]?.instrument);
+        const validId = isMusic
+          ? /^COD-\d{4}-\d{3,}$/.test(newStudentId)
+          : /^COD-\d{4}\/\d{4}-\d{4,}$/.test(newStudentId);
+        if (!validId) {
+          return res.status(400).json({
+            error: isMusic
+              ? 'Music student IDs must use COD-YYYY-NNN format'
+              : 'Regular student IDs must use COD-YYYY/YYYY-NNNN format',
+          });
+        }
+        sUpdates.student_id = newStudentId;
+      }
 
       if (Object.keys(sUpdates).length > 0) {
         sUpdates.updated_at = new Date().toISOString();
@@ -360,12 +818,7 @@ class AdminController {
         if (error) throw error;
       }
 
-      const { data: sRows } = await supabaseAdmin
-        .from('students')
-        .select('user_id')
-        .eq('id', studentId)
-        .limit(1);
-      const userId = sRows?.[0]?.user_id;
+      const userId = existingStudent.user_id;
 
       if (userId) {
         const uUpdates = {};
@@ -379,6 +832,24 @@ class AdminController {
             .update(uUpdates)
             .eq('id', userId);
           if (error) throw error;
+        }
+      }
+
+      if (
+        requestedStudentId !== undefined &&
+        String(requestedStudentId).trim() !== existingStudent.student_id
+      ) {
+        try {
+          const notificationController = require('./notificationController');
+          await notificationController.pushNotification({
+            studentId,
+            title: 'Student ID updated',
+            message: `Your student ID has been changed to ${String(requestedStudentId).trim()}.`,
+            type: 'student_id_updated',
+            link: '/student/profile',
+          });
+        } catch (notificationError) {
+          console.warn('Student ID change notification failed:', notificationError.message);
         }
       }
 
@@ -586,13 +1057,351 @@ class AdminController {
     }
   }
 
+  async getAdmissions(req, res) {
+    try {
+      const { status } = req.query;
+      let query = supabaseAdmin
+        .from('admissions')
+        .select('*')
+        .order('created_at', { ascending: false });
+      if (status === 'pending') query = query.in('status', ['pending', 'payment_submitted']);
+      else if (status) query = query.eq('status', status);
+
+      const { data, error } = await query;
+      if (error) throw error;
+      res.json({
+        success: true,
+        admissions: (data || []).map((admission) => ({
+          ...admission,
+          confirmationPrompt: `Are you sure you want to approve ${admission.student_name || 'this student'}'s admission?`,
+          approvalEndpoint: `/api/admin/admissions/${admission.id}/approve`,
+        })),
+      });
+    } catch (error) {
+      console.error('❌ Get admissions error:', error.message);
+      res.status(500).json({
+        error: 'Failed to fetch admissions',
+        details: error.message,
+      });
+    }
+  }
+
+  async getAdmissionReviewQueue(req, res) {
+    try {
+      const { data: admissions, error } = await supabaseAdmin
+        .from('admissions')
+        .select('*')
+        .in('status', ['pending', 'payment_submitted'])
+        .order('created_at', { ascending: false });
+      if (error) throw error;
+
+      const studentIds = [...new Set((admissions || []).map((admission) => admission.student_id))];
+      const studentMap = {};
+      const userIds = [];
+      if (studentIds.length) {
+        const { data: students, error: studentsError } = await supabaseAdmin
+          .from('students')
+          .select('id, user_id, student_id, full_name, email')
+          .in('id', studentIds);
+        if (studentsError) throw studentsError;
+        (students || []).forEach((student) => {
+          studentMap[student.id] = student;
+          if (student.user_id) userIds.push(student.user_id);
+        });
+      }
+
+      const userMap = {};
+      if (userIds.length) {
+        const { data: users, error: usersError } = await supabaseAdmin
+          .from('users')
+          .select('id, email, phone')
+          .in('id', [...new Set(userIds)]);
+        if (usersError) throw usersError;
+        (users || []).forEach((user) => { userMap[user.id] = user; });
+      }
+
+      const reviewItems = (admissions || []).map((admission) => {
+        const student = studentMap[admission.student_id] || null;
+        const user = student?.user_id ? userMap[student.user_id] : null;
+        const rawAmount = admission.amount_due ?? admission.fee_amount ?? process.env.ADMISSION_FEE_AMOUNT;
+        const parsedAmount = Number(rawAmount);
+        const paymentSubmitted = admission.status === 'payment_submitted';
+        return {
+          ...admission,
+          reviewType: paymentSubmitted ? 'bank_transfer' : 'admission',
+          paymentStatus: paymentSubmitted ? 'awaiting_admin_verification' : 'awaiting_transfer',
+          confirmationPrompt: `Are you sure you want to approve ${admission.student_name || student?.full_name || 'this student'}'s admission?`,
+          amountDue:
+            rawAmount !== undefined && rawAmount !== null && rawAmount !== '' && Number.isFinite(parsedAmount)
+              ? parsedAmount
+              : null,
+          amountPaid: admission.amount_paid === null || admission.amount_paid === undefined
+            ? null
+            : Number(admission.amount_paid),
+          student: student
+            ? { ...student, email: user?.email || student.email || admission.guardian_email || null, phone: user?.phone || admission.guardian_phone || null }
+            : null,
+        };
+      });
+
+      return res.json({
+        success: true,
+        items: reviewItems,
+        summary: {
+          pendingAdmissions: reviewItems.filter((item) => item.status === 'pending').length,
+          transfersAwaitingVerification: reviewItems.filter((item) => item.status === 'payment_submitted').length,
+          total: reviewItems.length,
+        },
+      });
+    } catch (error) {
+      console.error('Get admission review queue error:', error.message);
+      return res.status(500).json({ error: 'Failed to fetch admission review queue' });
+    }
+  }
+
+  async approveAdmission(req, res) {
+    let approvalStage = 'load admission';
+    try {
+      const { admissionId } = req.params;
+      const { confirmationMessage } = req.body || {};
+      const { data: admission, error: admissionError } = await supabaseAdmin
+        .from('admissions')
+        .select('*')
+        .eq('id', admissionId)
+        .maybeSingle();
+      if (admissionError) throw admissionError;
+      if (!admission) {
+        return res.status(404).json({ error: 'Admission not found' });
+      }
+      if (admission.status === 'rejected') {
+        return res.status(409).json({ error: 'Rejected admissions cannot be approved' });
+      }
+      approvalStage = 'load student account';
+      const { data: student, error: studentError } = await supabaseAdmin
+        .from('students')
+        .select('user_id, email, full_name')
+        .eq('id', admission.student_id)
+        .maybeSingle();
+      if (studentError) throw studentError;
+
+      let user = null;
+      if (student?.user_id) {
+        const { data: userRows, error: userError } = await supabaseAdmin
+          .from('users')
+          .select('email, full_name')
+          .eq('id', student.user_id)
+          .limit(1);
+        if (userError) throw userError;
+        user = userRows?.[0] || null;
+      }
+
+      let updatedAdmission = admission;
+      let approvedPaymentAmount = null;
+      let approvedPaymentDuration = null;
+      if (admission.status !== 'approved') {
+        const submittedAmount =
+          req.body?.amountReceived ??
+          req.body?.amount_received ??
+          req.body?.amountPaid ??
+          req.body?.amount_paid ??
+          req.body?.selectedAmount ??
+          req.body?.selected_amount ??
+          req.body?.amountToPay ??
+          req.body?.amount_to_pay ??
+          req.body?.amount ??
+          admission.amount_paid ??
+          admission.amount_due ??
+          admission.fee_amount ??
+          process.env.ADMISSION_FEE_AMOUNT;
+        if (admission.status === 'payment_submitted') {
+          const parsedAmount = Number(submittedAmount);
+          approvedPaymentDuration = resolvePaymentDuration(req.body);
+          if (
+            submittedAmount === undefined ||
+            submittedAmount === null ||
+            submittedAmount === '' ||
+            !Number.isFinite(parsedAmount) ||
+            parsedAmount <= 0
+          ) {
+            return res.status(400).json({
+              error: 'A valid selected payment amount is required to approve this bank transfer.',
+              code: 'PAYMENT_AMOUNT_REQUIRED',
+            });
+          }
+          if (!approvedPaymentDuration) {
+            return res.status(400).json({
+              error: 'A valid payment duration is required (for example: monthly, termly, or 45 days).',
+              code: 'PAYMENT_DURATION_REQUIRED',
+            });
+          }
+          approvedPaymentAmount = parsedAmount;
+        }
+
+        approvalStage = 'update admission status';
+        const admissionUpdates = {
+          status: 'approved',
+          updated_at: new Date().toISOString(),
+        };
+        if (admission.status === 'payment_submitted') {
+          admissionUpdates.amount_paid = Number(submittedAmount);
+        }
+        const { data, error: updateError } = await supabaseAdmin
+          .from('admissions')
+          .update(admissionUpdates)
+          .eq('id', admissionId)
+          .in('status', ['pending', 'payment_submitted'])
+          .select()
+          .maybeSingle();
+        if (updateError) throw updateError;
+        if (!data) {
+          return res.status(409).json({ error: 'Admission is no longer pending review' });
+        }
+        updatedAdmission = data;
+      }
+
+      const recipient = user?.email || student?.email || admission.guardian_email;
+      let paymentRecorded = false;
+      let paymentWarning = null;
+      if (admission.status === 'payment_submitted') {
+        const rawAmount =
+          req.body?.amountReceived ??
+          req.body?.amount_received ??
+          req.body?.amountPaid ??
+          req.body?.amount_paid ??
+          req.body?.selectedAmount ??
+          req.body?.selected_amount ??
+          req.body?.amountToPay ??
+          req.body?.amount_to_pay ??
+          req.body?.amount ??
+          admission.amount_paid ??
+          admission.amount_due ??
+          admission.fee_amount ??
+          process.env.ADMISSION_FEE_AMOUNT;
+        const amount = Number(rawAmount);
+        if (
+          rawAmount === undefined ||
+          rawAmount === null ||
+          rawAmount === '' ||
+          !Number.isFinite(amount) ||
+          amount <= 0
+        ) {
+          paymentWarning = 'Admission approved, but payment history was not recorded because no valid fee amount is configured.';
+        } else {
+          const paymentId = `BANK-${admission.id}`;
+          try {
+            const { data: existingPayment, error: existingPaymentError } = await supabaseAdmin
+              .from('payments')
+              .select('id')
+              .eq('payment_id', paymentId)
+              .maybeSingle();
+            if (existingPaymentError) throw existingPaymentError;
+
+            if (!existingPayment) {
+              const paidAt = updatedAdmission.updated_at || new Date().toISOString();
+              const { error: paymentInsertError } = await supabaseAdmin
+                .from('payments')
+                .insert({
+                  student_id: admission.student_id,
+                  payment_id: paymentId,
+                  reference: `BANK-${admission.admission_number || admission.id}`,
+                  amount,
+                  currency: 'NGN',
+                  plan: approvedPaymentDuration?.plan || 'monthly',
+                  duration_days: approvedPaymentDuration?.durationDays || 30,
+                  payment_type: 'school_fees',
+                  payment_method: 'bank_transfer',
+                  description: [admission.course, admission.track_name].filter(Boolean).join(' · ') || 'School fees',
+                  status: 'completed',
+                  payer_email: recipient || null,
+                  payment_date: paidAt,
+                  created_at: paidAt,
+                  updated_at: paidAt,
+                });
+              if (paymentInsertError) throw paymentInsertError;
+            }
+            paymentRecorded = true;
+          } catch (paymentError) {
+            console.error('Approved transfer payment history insert failed:', paymentError.message);
+            paymentWarning = 'Admission approved, but the payment history record could not be saved.';
+          }
+        }
+      }
+
+      const message = String(confirmationMessage || '').trim() ||
+        `Your admission to ${admission.course || 'Clan of David Music'} has been approved. You can now log in to your student account.`;
+      const frontendUrl = (process.env.FRONTEND_URL || 'http://localhost:5173').split(',')[0].trim().replace(/\/$/, '');
+      const loginUrl = `${frontendUrl}/login?email=${encodeURIComponent(recipient || '')}`;
+      const htmlMessage = message
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;')
+        .replace(/\n/g, '<br>');
+      approvalStage = 'send approval email';
+      const emailInfo = await sendMail({
+        to: recipient,
+        subject: 'Your admission has been approved',
+        text: `${message}\n\nLog in to your student account: ${loginUrl}`,
+        html: `<p>${htmlMessage}</p><p><a href="${loginUrl}">Log in to your student account</a></p>`,
+      });
+
+      return res.json({
+        success: true,
+        admission: updatedAdmission,
+        emailSent: Boolean(emailInfo),
+        email: recipient || null,
+        paymentRecorded,
+        amountReceived: approvedPaymentAmount,
+        duration: approvedPaymentDuration,
+        message: admission.status === 'approved'
+          ? 'Admission is approved; confirmation email resent'
+          : 'Admission approved and confirmation email sent',
+        ...(emailInfo ? {} : { emailWarning: 'Admission approved, but email delivery failed. Check SMTP configuration and retry notification.' }),
+        ...(paymentWarning ? { paymentWarning } : {}),
+      });
+    } catch (error) {
+      console.error(`❌ Approve admission error during ${approvalStage}:`, error);
+      return res.status(500).json({
+        error: `Failed to approve admission during ${approvalStage}: ${error.message}`,
+        stage: approvalStage,
+        details: error.message,
+      });
+    }
+  }
+
+  async rejectAdmission(req, res) {
+    try {
+      const { admissionId } = req.params;
+      const { adminNote } = req.body || {};
+      const { data: admission, error } = await supabaseAdmin
+        .from('admissions')
+        .update({
+          status: 'rejected',
+          admin_note: adminNote || null,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', admissionId)
+        .neq('status', 'approved')
+        .select()
+        .maybeSingle();
+      if (error) throw error;
+      if (!admission) return res.status(409).json({ error: 'Admission not found or already approved' });
+
+      return res.json({ success: true, admission });
+    } catch (error) {
+      console.error('Reject admission error:', error.message);
+      return res.status(500).json({ error: 'Failed to reject admission' });
+    }
+  }
+
   async getPayments(req, res) {
     try {
       const { status, studentId } = req.query;
       let query = supabaseAdmin
         .from('payments')
         .select(
-          `id, payment_id, reference, amount, plan, status, description,
+          `id, payment_id, reference, amount, plan, duration_days, status, description,
            payer_email, payment_date, created_at, student_id,
            student:students ( id, student_id, full_name )`
         )
@@ -600,16 +1409,74 @@ class AdminController {
       if (status) query = query.eq('status', status);
       if (studentId) query = query.eq('student_id', studentId);
 
-      const { data, error } = await query;
+      const [paymentsResult, transfersResult] = await Promise.all([
+        query,
+        supabaseAdmin
+          .from('admissions')
+          .select('*')
+          .eq('status', 'payment_submitted')
+          .order('created_at', { ascending: false }),
+      ]);
+      const { data, error } = paymentsResult;
       if (error) throw error;
+      if (transfersResult.error) throw transfersResult.error;
 
-      const completed = (data || []).filter((p) => p.status === 'completed');
-      const pending = (data || []).filter((p) => p.status === 'pending');
-      const failed = (data || []).filter((p) => p.status === 'failed');
+      const includeTransfers = !status || ['pending', 'payment_submitted'].includes(status);
+      const bankTransfers = includeTransfers
+        ? (transfersResult.data || [])
+            .filter((admission) => !studentId || admission.student_id === studentId)
+            .map((admission) => {
+              const rawAmount =
+                admission.selected_amount ??
+                admission.selectedAmount ??
+                admission.amount_paid ??
+                admission.amount_due ??
+                admission.fee_amount ??
+                process.env.ADMISSION_FEE_AMOUNT;
+              const parsedAmount = Number(rawAmount);
+              const amount =
+                rawAmount !== undefined && rawAmount !== null && rawAmount !== '' && Number.isFinite(parsedAmount)
+                  ? parsedAmount
+                  : null;
+
+              return {
+                id: admission.id,
+                payment_id: admission.admission_number || admission.id,
+                reference: admission.admission_number || null,
+                amount,
+                amount_paid: amount,
+                selected_amount: amount,
+                plan: null,
+                status: 'pending',
+                payment_type: 'bank_transfer',
+                description: `Bank transfer reported for ${[admission.course, admission.track_name].filter(Boolean).join(' · ')}`,
+                payer_email: admission.guardian_email || null,
+                payment_date: null,
+                created_at: admission.created_at,
+                student_id: admission.student_id,
+                student: {
+                  id: admission.student_id,
+                  student_id: null,
+                  full_name: admission.student_name || null,
+                },
+                admission_id: admission.id,
+                admission_status: admission.status,
+                confirmationPrompt: `Are you sure you want to approve ${admission.student_name || 'this student'}'s admission?`,
+                approval_endpoint: `/api/admin/payments/${admission.id}/approve`,
+              };
+            })
+        : [];
+      const paymentList = [...(data || []), ...bankTransfers].sort(
+        (left, right) => new Date(right.created_at || 0) - new Date(left.created_at || 0)
+      );
+
+      const completed = paymentList.filter((p) => p.status === 'completed');
+      const pending = paymentList.filter((p) => p.status === 'pending');
+      const failed = paymentList.filter((p) => p.status === 'failed');
 
       res.json({
         success: true,
-        payments: data || [],
+        payments: paymentList,
         summary: {
           totalCollected: completed.reduce(
             (s, p) => s + Number(p.amount || 0),
@@ -622,13 +1489,170 @@ class AdminController {
           countCompleted: completed.length,
           countPending: pending.length,
           countFailed: failed.length,
-          countTotal: data?.length || 0,
+          countTotal: paymentList.length,
         },
       });
     } catch (error) {
       console.error('❌ Get payments error:', error.message);
       res.status(500).json({
         error: 'Failed to fetch payments',
+        details: error.message,
+      });
+    }
+  }
+
+  // ─── NEW: approve a bank transfer payment row ───
+  // POST /api/admin/payments/:paymentId/approve
+  // Body: { amountReceived, duration, durationUnit, durationDays, loginUrl }
+  async approveBankTransfer(req, res) {
+    try {
+      const { paymentId } = req.params;
+      const {
+        amountReceived,
+        duration,
+        durationUnit,
+        durationDays,
+      } = req.body || {};
+
+      // 1. Load the payment
+      const { data: payment, error: payErr } = await supabaseAdmin
+        .from('payments')
+        .select('*')
+        .eq('id', paymentId)
+        .maybeSingle();
+      if (payErr) throw payErr;
+      if (!payment) {
+        return res.status(404).json({ error: 'Payment not found' });
+      }
+      if (!payment.student_id) {
+        return res.status(400).json({
+          error:
+            'This payment has no linked student. Cannot approve it automatically.',
+        });
+      }
+
+      // 2. Resolve amount + duration
+      const numericAmount = Number(
+        amountReceived ?? payment.amount ?? 0
+      );
+      if (!Number.isFinite(numericAmount) || numericAmount <= 0) {
+        return res
+          .status(400)
+          .json({ error: 'A valid received amount is required.' });
+      }
+
+      // Prefer explicit durationDays; otherwise derive from duration+unit
+      let resolvedDuration = resolvePaymentDuration(req.body);
+      if (!resolvedDuration && durationDays) {
+        resolvedDuration = {
+          plan: 'custom',
+          durationDays: Number(durationDays) || 30,
+        };
+      }
+      if (!resolvedDuration) {
+        resolvedDuration = { plan: 'monthly', durationDays: 30 };
+      }
+
+      // 3. Mark the payment completed
+      const now = new Date().toISOString();
+      const { data: updatedPayment, error: updateErr } = await supabaseAdmin
+        .from('payments')
+        .update({
+          status: 'completed',
+          amount: numericAmount,
+          plan: resolvedDuration.plan,
+          duration_days: resolvedDuration.durationDays,
+          payment_date: now,
+          updated_at: now,
+        })
+        .eq('id', paymentId)
+        .select()
+        .maybeSingle();
+      if (updateErr) throw updateErr;
+
+      // 4. Find the linked admission — by student_id, NOT by id
+      let admission = null;
+      let admissionApproved = false;
+      const { data: admissionRows, error: admErr } = await supabaseAdmin
+        .from('admissions')
+        .select('*')
+        .eq('student_id', payment.student_id)
+        .order('created_at', { ascending: false })
+        .limit(1);
+      if (admErr) throw admErr;
+      admission = admissionRows?.[0] || null;
+
+      if (admission) {
+        if (admission.status !== 'approved') {
+          const { data: updAdm, error: updAdmErr } = await supabaseAdmin
+            .from('admissions')
+            .update({
+              status: 'approved',
+              amount_paid: numericAmount,
+              updated_at: now,
+            })
+            .eq('id', admission.id)
+            .select()
+            .maybeSingle();
+          if (updAdmErr) throw updAdmErr;
+          admission = updAdm || admission;
+        }
+        admissionApproved = true;
+      }
+
+      // 5. Send confirmation email (best-effort)
+      let emailSent = false;
+      try {
+        const { data: studentRows } = await supabaseAdmin
+          .from('students')
+          .select('user_id, email, full_name, user:users ( email, full_name )')
+          .eq('id', payment.student_id)
+          .maybeSingle();
+
+        const recipient =
+          studentRows?.user?.email ||
+          studentRows?.email ||
+          payment.payer_email ||
+          null;
+
+        if (recipient) {
+          const frontendUrl = (
+            process.env.FRONTEND_URL || 'http://localhost:5173'
+          )
+            .split(',')[0]
+            .trim()
+            .replace(/\/$/, '');
+          const loginUrl = `${frontendUrl}/login?email=${encodeURIComponent(
+            recipient
+          )}`;
+          const emailInfo = await sendMail({
+            to: recipient,
+            subject: 'Your payment has been approved',
+            text: `Your payment of ₦${numericAmount.toLocaleString()} has been approved. Log in: ${loginUrl}`,
+            html: `<p>Your payment of <strong>₦${numericAmount.toLocaleString()}</strong> has been approved.</p><p><a href="${loginUrl}">Log in to your student account</a></p>`,
+          });
+          emailSent = Boolean(emailInfo);
+        }
+      } catch (mailErr) {
+        console.warn('Approval email failed:', mailErr.message);
+      }
+
+      return res.json({
+        success: true,
+        message: admissionApproved
+          ? 'Payment approved and admission linked.'
+          : 'Payment approved. No admission on file for this student.',
+        payment: updatedPayment || payment,
+        admission,
+        admissionApproved,
+        amountReceived: numericAmount,
+        duration: resolvedDuration,
+        emailSent,
+      });
+    } catch (error) {
+      console.error('❌ Approve bank transfer error:', error.message);
+      return res.status(500).json({
+        error: 'Failed to approve bank transfer',
         details: error.message,
       });
     }
@@ -1143,7 +2167,7 @@ class AdminController {
           updates.full_name || current.full_name || 'Your teacher';
 
         notified = await notifyStudentsOfStaffAssignment({
-          staffId,        // ← CHANGED: pass staffId so the deep-link works
+          staffId,
           staffName,
           category: finalCategory,
           levels: finalLevels,

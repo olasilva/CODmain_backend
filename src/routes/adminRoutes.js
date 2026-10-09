@@ -26,6 +26,24 @@ router.delete('/contact-messages/:id', contactController.deleteMessage);
 // Students
 // ═══════════════════════════════════════════════════════════════
 router.get('/students', adminController.getStudents);
+
+// ─── Global ID-card requests ───
+router.get('/id-card-requests', adminController.getIdCardRequests);
+router.post('/id-card-requests/:requestId/approve', adminController.approveIdCardRequest);
+router.post('/id-card-requests/:requestId/reject', adminController.rejectIdCardRequest);
+
+// ─── Per-student ID-card requests ───
+// NOTE: these must come BEFORE the generic '/students/:studentId'
+router.get(
+  '/students/:studentId/id-card-requests',
+  adminController.getStudentIdCardRequests
+);
+router.post(
+  '/students/:studentId/id-card-requests/:requestId/approve',
+  adminController.approveStudentIdCardRequest
+);
+
+// ─── Student CRUD ───
 router.get('/students/:studentId', adminController.getStudentDetails);
 router.put('/students/:studentId', adminController.updateStudent);
 router.delete('/students/:studentId', adminController.deleteStudent);
@@ -66,9 +84,51 @@ router.put('/staff/:staffId', adminController.updateStaff);
 router.delete('/staff/:staffId', adminController.deleteStaff);
 
 // ═══════════════════════════════════════════════════════════════
+// Admissions
+// ═══════════════════════════════════════════════════════════════
+router.get('/admissions', adminController.getAdmissions);
+router.get('/admission-reviews', adminController.getAdmissionReviewQueue);
+
+router.put('/admissions/:admissionId/status', (req, res) => {
+  const requestedStatus = String(req.body?.status || '').trim().toLowerCase();
+  if (['approved', 'admitted', 'accepted'].includes(requestedStatus)) {
+    return adminController.approveAdmission(req, res);
+  }
+  if (requestedStatus === 'rejected') {
+    return adminController.rejectAdmission(req, res);
+  }
+  return res.status(400).json({
+    error: 'status must be approved, admitted, accepted, or rejected',
+  });
+});
+
+router
+  .route('/admissions/:admissionId/approve')
+  .post(adminController.approveAdmission)
+  .put(adminController.approveAdmission)
+  .patch(adminController.approveAdmission);
+
+router
+  .route('/admissions/:admissionId/reject')
+  .post(adminController.rejectAdmission)
+  .put(adminController.rejectAdmission);
+
+// ═══════════════════════════════════════════════════════════════
 // Payments
 // ═══════════════════════════════════════════════════════════════
 router.get('/payments', adminController.getPayments);
+
+// Approve a bank-transfer payment row. Delegates to
+// adminController.approveBankTransfer, which:
+//   – marks the payment completed
+//   – finds the linked admission by student_id
+//   – approves the admission
+//   – sends the confirmation email
+router
+  .route('/payments/:paymentId/approve')
+  .post(adminController.approveBankTransfer)
+  .put(adminController.approveBankTransfer)
+  .patch(adminController.approveBankTransfer);
 
 // ═══════════════════════════════════════════════════════════════
 // Reports
