@@ -11,11 +11,13 @@ const { authenticateToken } = require('../middleware/auth');
 router.get('/profile', authenticateToken, studentController.getProfile);
 router.put('/profile', authenticateToken, studentController.updateProfile);
 
-// ─── My programme & classes ───
+// ─── ID card requests ───
+router.get('/id-card-requests', authenticateToken, studentController.getMyIdCardRequest);
+router.post('/id-card-requests', authenticateToken, studentController.submitIdCardRequest);
+
+// ─── My programme & classes (from admission) ───
 router.get('/my-programme', authenticateToken, studentController.getMyProgramme);
 router.get('/my-classes', authenticateToken, studentController.getMyEnrolledClasses);
-router.get('/id-card-request', authenticateToken, studentController.getMyIdCardRequest);
-router.post('/id-card-request', authenticateToken, studentController.submitIdCardRequest);
 
 // ─── Attendance ───
 router.get('/attendance', authenticateToken, studentController.getMyAttendance);
