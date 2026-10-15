@@ -40,6 +40,37 @@ class SupabaseService {
     }
   }
 
+  async getUserByUsername(username) {
+    const value = String(username || '').trim().toLowerCase();
+    if (!value) return null;
+
+    try {
+      const { data, error } = await supabaseAdmin
+        .from('users')
+        .select('*')
+        .ilike('username', value)
+        .limit(1);
+
+      if (error) throw error;
+      return data && data.length > 0 ? data[0] : null;
+    } catch (error) {
+      console.error('getUserByUsername error:', error);
+      throw error;
+    }
+  }
+
+  async getUserByIdentifier(identifier) {
+    const value = String(identifier || '').trim().toLowerCase();
+    if (!value) return null;
+
+    // Username first
+    const byUsername = await this.getUserByUsername(value);
+    if (byUsername) return byUsername;
+
+    // Fall back to email
+    return await this.getUserByEmail(value);
+  }
+
   async createUser(userData) {
     try {
       const { data, error } = await supabaseAdmin
@@ -73,7 +104,7 @@ class SupabaseService {
       return data && data.length > 0 ? data[0] : null;
     } catch (error) {
       console.error(`update ${table} error:`, error);
-      return null;
+      throw error;
     }
   }
 

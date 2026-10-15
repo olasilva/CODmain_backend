@@ -37,7 +37,8 @@ function publicUser(user) {
   return {
     id: user.id,
     fullName: user.full_name || user.fullName,
-    email: user.email,
+    username: user.username || null,
+    email: user.email || null,
     phone: user.phone || '',
     role: user.role,
     avatar_url: user.avatar_url,
@@ -46,17 +47,24 @@ function publicUser(user) {
 }
 
 // ============================================================
-// Register new user — STUDENTS ONLY
+// Register new user — STUDENTS ONLY (username-first)
 // ============================================================
 async function register(req, res) {
   try {
     console.log('📝 Registration attempt:', req.body);
 
-    const { fullName, email, phone, password, role = 'student' } = req.body;
+    const {
+      fullName,
+      username,
+      phone,
+      password,
+      role = 'student',
+      email, // optional, still accepted for back-compat
+    } = req.body;
 
-    if (!fullName || !email || !password) {
+    if (!fullName || !username || !password) {
       return res.status(400).json({
-        error: 'Full name, email, and password are required',
+        error: 'Full name, username, and password are required',
       });
     }
 
@@ -67,20 +75,43 @@ async function register(req, res) {
       });
     }
 
-    const normalizedEmail = email.trim().toLowerCase();
+    // Slugify + validate username
+    const normalizedUsername = String(username)
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9-]/g, '');
 
-    const existingUser = await supabaseService.getUserByEmail(normalizedEmail);
-    if (existingUser) {
-      return res.status(409).json({
-        error: 'An account with this email already exists.',
+    if (normalizedUsername.length < 3 || normalizedUsername.length > 40) {
+      return res.status(400).json({
+        error: 'Username must be 3–40 characters (a-z, 0-9, dash).',
       });
+    }
+
+    const existing = await supabaseService.getUserByUsername(normalizedUsername);
+    if (existing) {
+      return res.status(409).json({
+        error: 'That username is already taken. Please choose another.',
+      });
+    }
+
+    // If an email was supplied, verify it isn't taken
+    let normalizedEmail = null;
+    if (email && String(email).trim()) {
+      normalizedEmail = String(email).trim().toLowerCase();
+      const byEmail = await supabaseService.getUserByEmail(normalizedEmail);
+      if (byEmail) {
+        return res.status(409).json({
+          error: 'An account with this email already exists.',
+        });
+      }
     }
 
     const passwordHash = await bcrypt.hash(password, 12);
 
     const user = await supabaseService.createUser({
       full_name: fullName.trim(),
-      email: normalizedEmail,
+      username: normalizedUsername,
+      email: normalizedEmail, // may be null
       phone: phone || '',
       role: 'student', // 👈 always student, regardless of what was sent
       password_hash: passwordHash,
@@ -90,7 +121,7 @@ async function register(req, res) {
 
     const token = signToken(user);
 
-    console.log('✅ User registered:', user.email);
+    console.log('✅ User registered:', user.username || user.email);
 
     res.status(201).json({
       user: publicUser(user),
@@ -106,30 +137,37 @@ async function register(req, res) {
 }
 
 // ============================================================
-// Regular login
+// Regular login (accepts username OR email as `identifier`)
 // ============================================================
 async function login(req, res) {
   try {
-    console.log('🔑 Login attempt:', req.body.email);
+    const {
+      identifier, // preferred: username OR email
+      email, // back-compat
+      password,
+      role = 'student',
+    } = req.body;
 
-    const { email, password, role = 'student' } = req.body;
+    const raw = identifier || email;
 
-    if (!email || !password) {
-      return res.status(400).json({ error: 'Email and password are required' });
+    console.log('🔑 Login attempt:', raw);
+
+    if (!raw || !password) {
+      return res
+        .status(400)
+        .json({ error: 'Username (or email) and password are required' });
     }
 
-    const normalizedEmail = email.trim().toLowerCase();
-
-    const user = await supabaseService.getUserByEmail(normalizedEmail);
+    const user = await supabaseService.getUserByIdentifier(raw);
 
     if (!user) {
-      console.log('❌ User not found:', normalizedEmail);
+      console.log('❌ User not found:', raw);
       return res
         .status(401)
-        .json({ error: 'Invalid email, password, or account type.' });
+        .json({ error: 'Invalid username, password, or account type.' });
     }
 
-    console.log('✅ User found:', user.email);
+    console.log('✅ User found:', user.username || user.email);
 
     if (user.role !== role) {
       console.log('❌ Role mismatch:', user.role, '!=', role);
@@ -140,15 +178,17 @@ async function login(req, res) {
 
     const isValidPassword = await bcrypt.compare(password, user.password_hash);
     if (!isValidPassword) {
-      console.log('❌ Invalid password for:', user.email);
+      console.log('❌ Invalid password for:', user.username || user.email);
       return res
         .status(401)
-        .json({ error: 'Invalid email, password, or account type.' });
+        .json({ error: 'Invalid username, password, or account type.' });
     }
 
-    const admissionStatus = user.role === 'student'
-      ? await getLatestAdmissionStatus(user.id)
-      : null;
+    const admissionStatus =
+      user.role === 'student'
+        ? await getLatestAdmissionStatus(user.id)
+        : null;
+
     if (user.role === 'student' && admissionStatus?.toLowerCase() !== 'approved') {
       return res.status(403).json({
         error: 'Admission is in progress. Your transfer is awaiting admin approval.',
@@ -161,14 +201,14 @@ async function login(req, res) {
     });
 
     const token = signToken(user);
-
-    console.log('✅ Login successful:', user.email);
-
     const userData = publicUser(user);
+
+    console.log('✅ Login successful:', userData.username || userData.email);
+
     res.json({
       user: userData,
       token,
-      message: `Welcome, ${userData.fullName || userData.email}`,
+      message: `Welcome, ${userData.fullName || userData.username || userData.email}`,
       admissionStatus,
     });
   } catch (error) {
@@ -252,9 +292,11 @@ async function googleLogin(req, res) {
       });
     }
 
-    const admissionStatus = user.role === 'student'
-      ? await getLatestAdmissionStatus(user.id)
-      : null;
+    const admissionStatus =
+      user.role === 'student'
+        ? await getLatestAdmissionStatus(user.id)
+        : null;
+
     if (user.role === 'student' && admissionStatus?.toLowerCase() !== 'approved') {
       return res.status(403).json({
         error: 'Admission is in progress. Your transfer is awaiting admin approval.',
@@ -268,7 +310,7 @@ async function googleLogin(req, res) {
     res.json({
       user: userData,
       token: jwtToken,
-      message: `Welcome, ${userData.fullName || userData.email}`,
+      message: `Welcome, ${userData.fullName || userData.username || userData.email}`,
       admissionStatus,
     });
   } catch (error) {
@@ -292,9 +334,11 @@ async function googleCallback(req, res) {
       return res.redirect(`${frontendUrl}/login?error=oauth_failed`);
     }
 
-    const admissionStatus = user.role === 'student'
-      ? await getLatestAdmissionStatus(user.id)
-      : null;
+    const admissionStatus =
+      user.role === 'student'
+        ? await getLatestAdmissionStatus(user.id)
+        : null;
+
     if (user.role === 'student' && admissionStatus?.toLowerCase() !== 'approved') {
       const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
       return res.redirect(`${frontendUrl}/login?error=admission_pending`);
@@ -302,8 +346,12 @@ async function googleCallback(req, res) {
 
     const token = signToken(user);
     const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
-    const welcomeName = encodeURIComponent(user.full_name || user.email);
-    res.redirect(`${frontendUrl}/oauth-callback?token=${token}&welcome=${welcomeName}`);
+    const welcomeName = encodeURIComponent(
+      user.full_name || user.username || user.email
+    );
+    res.redirect(
+      `${frontendUrl}/oauth-callback?token=${token}&welcome=${welcomeName}`
+    );
   } catch (error) {
     console.error('Google Callback Error:', error);
     const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
@@ -336,13 +384,59 @@ async function getProfile(req, res) {
 async function updateProfile(req, res) {
   try {
     const userId = req.user.id;
-    const updates = req.body;
+    const updates = { ...req.body };
 
+    // Strip fields users must not change themselves
     delete updates.id;
     delete updates.password_hash;
     delete updates.created_at;
+    delete updates.updated_at;
     delete updates.role;
-    delete updates.email;
+    delete updates.is_active;
+    delete updates.email_verified;
+    delete updates.google_id;
+    delete updates.last_login;
+
+    // Username changes must go through the same slugify + uniqueness rules
+    if (updates.username !== undefined) {
+      const normalizedUsername = String(updates.username)
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9-]/g, '');
+
+      if (normalizedUsername.length < 3 || normalizedUsername.length > 40) {
+        return res.status(400).json({
+          error: 'Username must be 3–40 characters (a-z, 0-9, dash).',
+        });
+      }
+
+      const existing = await supabaseService.getUserByUsername(normalizedUsername);
+      if (existing && existing.id !== userId) {
+        return res.status(409).json({
+          error: 'That username is already taken. Please choose another.',
+        });
+      }
+
+      updates.username = normalizedUsername;
+    }
+
+    // Email changes must be unique and normalized
+    if (updates.email !== undefined) {
+      const raw = String(updates.email || '').trim().toLowerCase();
+      if (!raw) {
+        delete updates.email; // don't allow clearing email via profile update
+      } else {
+        const byEmail = await supabaseService.getUserByEmail(raw);
+        if (byEmail && byEmail.id !== userId) {
+          return res.status(409).json({
+            error: 'An account with this email already exists.',
+          });
+        }
+        updates.email = raw;
+        // Force re-verification if you support it
+        updates.email_verified = false;
+      }
+    }
 
     const updatedUser = await supabaseService.update('users', userId, updates);
 
@@ -374,10 +468,10 @@ async function changePassword(req, res) {
       });
     }
 
-    if (newPassword.length < 6) {
-      return res
-        .status(400)
-        .json({ error: 'New password must be at least 6 characters' });
+    if (newPassword.length < 8 || newPassword.length > 128) {
+      return res.status(400).json({
+        error: 'New password must be between 8 and 128 characters',
+      });
     }
 
     const user = await supabaseService.getUserById(userId);
@@ -408,16 +502,26 @@ async function changePassword(req, res) {
 
 // ============================================================
 // Request a one-time password reset link
+// Accepts either `identifier` (username OR email) or `email`.
+// Always responds with the same generic message.
 // ============================================================
 async function requestPasswordReset(req, res) {
-  const email = String(req.body?.email || '').trim().toLowerCase();
-  if (!email) {
-    return res.status(400).json({ error: 'Email is required' });
+  const rawIdentifier = String(
+    req.body?.identifier || req.body?.email || ''
+  ).trim();
+
+  if (!rawIdentifier) {
+    return res.status(400).json({ error: 'Username or email is required' });
   }
 
   try {
-    const user = await supabaseService.getUserByEmail(email);
-    if (user) {
+    // Resolve to a user record
+    const user = await supabaseService.getUserByIdentifier(rawIdentifier);
+
+    // Only proceed if we found a user AND they have an email on file
+    if (user && user.email) {
+      const email = user.email.trim().toLowerCase();
+
       const token = crypto.randomBytes(32).toString('hex');
       const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
       const now = new Date().toISOString();
@@ -438,18 +542,19 @@ async function requestPasswordReset(req, res) {
         });
       if (insertError) throw insertError;
 
-      const frontendUrl =
-        (process.env.FRONTEND_URL || 'http://localhost:5173')
-          .split(',')[0]
-          .trim()
-          .replace(/\/$/, '');
+      const frontendUrl = (process.env.FRONTEND_URL || 'http://localhost:5173')
+        .split(',')[0]
+        .trim()
+        .replace(/\/$/, '');
       const resetUrl = `${frontendUrl}/reset-password?token=${token}`;
+
       const emailInfo = await sendMail({
         to: email,
         subject: 'Reset your Clan of David account password',
         text: `We received a request to reset your password. Use this link within 30 minutes: ${resetUrl}\n\nIf you did not request this, you can ignore this email.`,
         html: `<p>We received a request to reset your password.</p><p><a href="${resetUrl}">Choose a new password</a></p><p>This link expires in 30 minutes. If you did not request this, you can ignore this email.</p>`,
       });
+
       if (!emailInfo) {
         console.warn('Password reset email could not be sent for account:', email);
       }
@@ -458,7 +563,9 @@ async function requestPasswordReset(req, res) {
     return res.json({ success: true, message: PASSWORD_RESET_RESPONSE });
   } catch (error) {
     console.error('Password reset request error:', error.message);
-    return res.status(500).json({ error: 'Unable to process password reset request' });
+    return res
+      .status(500)
+      .json({ error: 'Unable to process password reset request' });
   }
 }
 
@@ -468,15 +575,20 @@ async function requestPasswordReset(req, res) {
 async function resetPassword(req, res) {
   const { token, newPassword } = req.body || {};
   if (typeof token !== 'string' || !token || typeof newPassword !== 'string') {
-    return res.status(400).json({ error: 'Reset token and new password are required' });
+    return res
+      .status(400)
+      .json({ error: 'Reset token and new password are required' });
   }
   if (newPassword.length < 8 || newPassword.length > 128) {
-    return res.status(400).json({ error: 'Password must be between 8 and 128 characters' });
+    return res
+      .status(400)
+      .json({ error: 'Password must be between 8 and 128 characters' });
   }
 
   try {
     const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
     const passwordHash = await bcrypt.hash(newPassword, 12);
+
     const { data: reset, error } = await supabaseAdmin.rpc(
       'reset_password_with_token',
       {
@@ -484,14 +596,19 @@ async function resetPassword(req, res) {
         p_password_hash: passwordHash,
       }
     );
+
     if (error) throw error;
+
     if (!reset) {
       return res.status(400).json({
         error: 'This password reset link is invalid, expired, or already used.',
       });
     }
 
-    return res.json({ success: true, message: 'Password updated. You can now log in.' });
+    return res.json({
+      success: true,
+      message: 'Password updated. You can now log in.',
+    });
   } catch (error) {
     console.error('Password reset error:', error.message);
     return res.status(500).json({ error: 'Unable to reset password' });
@@ -538,7 +655,7 @@ async function createStaff(req, res) {
         .json({ error: 'Full name and email are required' });
     }
 
-    const normalizedEmail = email.trim().toLowerCase();
+    const normalizedEmail = String(email).trim().toLowerCase();
 
     const existing = await supabaseService.getUserByEmail(normalizedEmail);
     if (existing) {
@@ -560,12 +677,12 @@ async function createStaff(req, res) {
       password_hash: passwordHash,
       is_active: true,
       must_change_password: true, // optional flag — add the column if you want to enforce
+      department: department || null,
       created_at: new Date().toISOString(),
     });
 
     // Email the credentials
     try {
-      const { sendMail } = require('../services/emailService');
       const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
       const loginUrl = `${frontendUrl}/login?role=staff&email=${encodeURIComponent(
         normalizedEmail
