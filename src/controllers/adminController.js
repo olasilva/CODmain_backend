@@ -1658,15 +1658,227 @@ class AdminController {
     }
   }
 
+  // ═══════════════════════════════════════════════════════════
+  // ACADEMIC SESSIONS & TERMS  ← NEW
+  // ═══════════════════════════════════════════════════════════
+
+  async getSessions(req, res) {
+    try {
+      const { data, error } = await supabaseAdmin
+        .from('academic_sessions')
+        .select(
+          `id, name, start_date, end_date, is_current, created_at,
+           terms:academic_terms (
+             id, term_number, start_date, end_date,
+             is_current, is_closed, closed_at
+           )`
+        )
+        .order('start_date', { ascending: false });
+      if (error) throw error;
+
+      const sessions = (data || []).map((s) => ({
+        ...s,
+        terms: (s.terms || []).sort((a, b) => a.term_number - b.term_number),
+      }));
+
+      res.json({ success: true, sessions });
+    } catch (error) {
+      console.error('❌ Get sessions error:', error.message);
+      res.status(500).json({
+        error: 'Failed to fetch sessions',
+        details: error.message,
+      });
+    }
+  }
+
+  async createSession(req, res) {
+    try {
+      const { name, startDate, endDate, terms } = req.body;
+
+      if (!name || !startDate || !endDate) {
+        return res.status(400).json({
+          error: 'name, startDate, and endDate are required',
+        });
+      }
+
+      const { data: session, error } = await supabaseAdmin
+        .from('academic_sessions')
+        .insert({
+          name: String(name).trim(),
+          start_date: startDate,
+          end_date: endDate,
+          is_current: false,
+        })
+        .select()
+        .single();
+      if (error) throw error;
+
+      if (Array.isArray(terms) && terms.length > 0) {
+        const rows = terms.map((t) => ({
+          session_id: session.id,
+          term_number: Number(t.term_number),
+          start_date: t.start_date,
+          end_date: t.end_date,
+          is_current: false,
+          is_closed: false,
+        }));
+        const { error: termErr } = await supabaseAdmin
+          .from('academic_terms')
+          .insert(rows);
+        if (termErr) throw termErr;
+      }
+
+      return res.status(201).json({ success: true, session });
+    } catch (error) {
+      console.error('❌ Create session error:', error.message);
+      res.status(500).json({
+        error: 'Failed to create session',
+        details: error.message,
+      });
+    }
+  }
+
+  async setCurrentTerm(req, res) {
+    try {
+      const { sessionId, termNumber } = req.body;
+      if (!sessionId || ![1, 2, 3].includes(Number(termNumber))) {
+        return res.status(400).json({
+          error: 'sessionId and termNumber (1|2|3) are required',
+        });
+      }
+
+      await supabaseAdmin
+        .from('academic_terms')
+        .update({ is_current: false })
+        .eq('is_current', true);
+      await supabaseAdmin
+        .from('academic_sessions')
+        .update({ is_current: false })
+        .eq('is_current', true);
+
+      const { error: termErr } = await supabaseAdmin
+        .from('academic_terms')
+        .update({ is_current: true })
+        .eq('session_id', sessionId)
+        .eq('term_number', Number(termNumber));
+      if (termErr) throw termErr;
+
+      const { error: sessErr } = await supabaseAdmin
+        .from('academic_sessions')
+        .update({ is_current: true })
+        .eq('id', sessionId);
+      if (sessErr) throw sessErr;
+
+      res.json({ success: true, sessionId, termNumber: Number(termNumber) });
+    } catch (error) {
+      console.error('❌ setCurrentTerm error:', error.message);
+      res.status(500).json({
+        error: 'Failed to set current term',
+        details: error.message,
+      });
+    }
+  }
+
+  async promotePreview(req, res) {
+    try {
+      const sessionId = req.query.sessionId;
+      const term = Number(req.query.term);
+      if (!sessionId || ![1, 2, 3].includes(term)) {
+        return res
+          .status(400)
+          .json({ error: 'sessionId and term (1|2|3) are required' });
+      }
+
+      const { data, error, count } = await supabaseAdmin
+        .from('students')
+        .select('id, full_name, student_id, level', { count: 'exact' })
+        .eq('current_session_id', sessionId)
+        .eq('current_term', term);
+      if (error) throw error;
+
+      res.json({
+        success: true,
+        count: count || 0,
+        sample: (data || []).slice(0, 10),
+      });
+    } catch (error) {
+      console.error('❌ Promote preview error:', error.message);
+      res.status(500).json({
+        error: 'Failed to preview promotion',
+        details: error.message,
+      });
+    }
+  }
+
+  async closeTermAndPromote(req, res) {
+    try {
+      const sessionId = req.params.sessionId;
+      const numericTerm = Number(req.params.term);
+
+      if (!sessionId || ![1, 2, 3].includes(numericTerm)) {
+        return res
+          .status(400)
+          .json({ error: 'sessionId and term (1|2|3) are required' });
+      }
+
+      const { data, error } = await supabaseAdmin.rpc('promote_cohort', {
+        p_session_id: sessionId,
+        p_term_number: numericTerm,
+        p_promoted_by: req.user.id,
+      });
+      if (error) throw error;
+
+      return res.json({ success: true, result: data });
+    } catch (error) {
+      console.error('❌ Close term / promote error:', error.message);
+      return res.status(500).json({
+        error: 'Failed to close term and promote students',
+        details: error.message,
+      });
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // REPORTS  ← REPLACED: now scoped to session + term
+  // ═══════════════════════════════════════════════════════════
+
   async getReports(req, res) {
     try {
+      const sessionId = req.query.sessionId || null;
+      const term = req.query.term ? Number(req.query.term) : null;
+
+      let studentsQ = supabaseAdmin
+        .from('students')
+        .select(
+          'id, created_at, status, academic_year, level, current_session_id, current_term'
+        );
+      let paymentsQ = supabaseAdmin
+        .from('payments')
+        .select('amount, status, created_at, session_id, term');
+      let admissionsQ = supabaseAdmin
+        .from('admissions')
+        .select('status, created_at, session_id, term');
+
+      if (sessionId) {
+        studentsQ = studentsQ.eq('current_session_id', sessionId);
+        paymentsQ = paymentsQ.eq('session_id', sessionId);
+        admissionsQ = admissionsQ.eq('session_id', sessionId);
+      }
+      if (term) {
+        studentsQ = studentsQ.eq('current_term', term);
+        paymentsQ = paymentsQ.eq('term', term);
+        admissionsQ = admissionsQ.eq('term', term);
+      }
+
       const [studentsRes, paymentsRes, admissionsRes] = await Promise.all([
-        supabaseAdmin
-          .from('students')
-          .select('id, created_at, status, academic_year'),
-        supabaseAdmin.from('payments').select('amount, status, created_at'),
-        supabaseAdmin.from('admissions').select('status, created_at'),
+        studentsQ,
+        paymentsQ,
+        admissionsQ,
       ]);
+
+      if (studentsRes.error) throw studentsRes.error;
+      if (paymentsRes.error) throw paymentsRes.error;
+      if (admissionsRes.error) throw admissionsRes.error;
 
       const students = studentsRes.data || [];
       const payments = paymentsRes.data || [];
@@ -1704,7 +1916,10 @@ class AdminController {
 
       const classDistribution = Object.entries(
         students.reduce((acc, s) => {
-          const key = s.academic_year || 'Unassigned';
+          const key =
+            s.level != null
+              ? `Level ${s.level}`
+              : s.academic_year || 'Unassigned';
           acc[key] = (acc[key] || 0) + 1;
           return acc;
         }, {})
@@ -1723,13 +1938,13 @@ class AdminController {
 
       res.json({
         success: true,
+        scope: { sessionId, term },
         stats: {
           totalStudents: students.length,
           totalRevenue,
           totalAdmissions: admissions.length,
-          pendingAdmissions: admissions.filter(
-            (a) => a.status === 'pending'
-          ).length,
+          pendingAdmissions: admissions.filter((a) => a.status === 'pending')
+            .length,
         },
         enrollmentTrend,
         feeCollection,

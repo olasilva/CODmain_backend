@@ -118,17 +118,23 @@ router
 // ═══════════════════════════════════════════════════════════════
 router.get('/payments', adminController.getPayments);
 
-// Approve a bank-transfer payment row. Delegates to
-// adminController.approveBankTransfer, which:
-//   – marks the payment completed
-//   – finds the linked admission by student_id
-//   – approves the admission
-//   – sends the confirmation email
 router
   .route('/payments/:paymentId/approve')
   .post(adminController.approveBankTransfer)
   .put(adminController.approveBankTransfer)
   .patch(adminController.approveBankTransfer);
+
+// ═══════════════════════════════════════════════════════════════
+// Academic sessions + terms + cohort promotion
+// ═══════════════════════════════════════════════════════════════
+router.get('/sessions', adminController.getSessions);
+router.post('/sessions', adminController.createSession);
+router.post('/terms/current', adminController.setCurrentTerm);
+router.get('/promotions/preview', adminController.promotePreview);
+router.post(
+  '/sessions/:sessionId/terms/:term/promote',
+  adminController.closeTermAndPromote
+);
 
 // ═══════════════════════════════════════════════════════════════
 // Reports
