@@ -57,6 +57,7 @@ const staticOrigins = [
 const envOrigins = (process.env.FRONTEND_URL || '')
   .split(',')
   .map((s) => s.trim())
+  .map((origin) => origin.replace(/\/+$/, ''))
   .filter(Boolean);
 
 const allowedOrigins = [...new Set([...staticOrigins, ...envOrigins])];
@@ -65,31 +66,31 @@ const allowedOrigins = [...new Set([...staticOrigins, ...envOrigins])];
 const vercelPreviewRegex = /^https:\/\/co-dmain[a-z0-9-]*\.vercel\.app$/;
 
 // Log the allowlist once at boot so it's easy to verify
+const corsOptions = {
+  origin: (origin, callback) => {
+    // Allow server-to-server / Postman requests (no origin header)
+    if (!origin) return callback(null, true);
+
+    // Exact allowlist match
+    if (allowedOrigins.includes(origin)) return callback(null, true);
+
+    // Vercel preview deployments
+    if (vercelPreviewRegex.test(origin)) return callback(null, true);
+
+    console.warn('🚫 CORS blocked origin:', origin);
+    return callback(new Error(`Origin ${origin} not allowed by CORS`));
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+};
+
 console.log('🔓 CORS allowlist:', allowedOrigins);
 
-app.use(
-  cors({
-    origin: (origin, callback) => {
-      // Allow server-to-server / Postman requests (no origin header)
-      if (!origin) return callback(null, true);
-
-      // Exact allowlist match
-      if (allowedOrigins.includes(origin)) return callback(null, true);
-
-      // Vercel preview deployments
-      if (vercelPreviewRegex.test(origin)) return callback(null, true);
-
-      console.warn('🚫 CORS blocked origin:', origin);
-      return callback(new Error(`Origin ${origin} not allowed by CORS`));
-    },
-    credentials: true,
-    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
-  })
-);
+app.use(cors(corsOptions));
 
 // Handle preflight for all routes
-app.options('*', cors());
+app.options('*', cors(corsOptions));
 
 // ═══════════════════════════════════════════════════════════════
 // 2. RATE LIMITING
