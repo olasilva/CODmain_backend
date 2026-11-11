@@ -1,5 +1,10 @@
 // src/controllers/admissionController.js
 const { supabaseAdmin } = require('../config/supabase');
+const {
+  canonicalAcademicYear,
+  canonicalTrackName,
+  trackCategory,
+} = require('../services/programStructure');
 
 class AdmissionController {
   // =========================================================
@@ -32,8 +37,10 @@ class AdmissionController {
       const comments = personal.comments || body.comments;
 
       const course = academic.course || body.course || body.campus || body.programme;
-      const trackName = academic.trackName || body.trackName || body.track;
-      const academicYear = body.academicYear || new Date().getFullYear().toString();
+      const trackName = canonicalTrackName(
+        academic.trackName || body.trackName || body.track
+      );
+      const academicYear = canonicalAcademicYear(body.academicYear);
 
       // NEW — from the merged application form
       const regularClass = academic.regularClass || body.regularClass || null;
@@ -43,6 +50,12 @@ class AdmissionController {
         return res.status(400).json({
           success: false,
           error: 'Course and track name are required',
+        });
+      }
+      if (trackCategory(trackName) === 'unknown') {
+        return res.status(400).json({
+          success: false,
+          error: 'Track must be Music, Academic, or Mixed Media',
         });
       }
 
@@ -91,19 +104,22 @@ class AdmissionController {
       }
 
       // Check for duplicate application
-      const { data: existing } = await supabaseAdmin
+      const { data: existing, error: existingError } = await supabaseAdmin
         .from('admissions')
-        .select('*')
+        .select('id, course, track_name')
         .eq('student_id', student.id)
-        .eq('course', course)
-        .eq('track_name', trackName)
-        .limit(1);
+        .eq('course', course);
+      if (existingError) throw existingError;
 
-      if (existing && existing.length > 0) {
+      const duplicate = (existing || []).find(
+        (row) => canonicalTrackName(row.track_name) === trackName
+      );
+
+      if (duplicate) {
         return res.status(409).json({
           success: false,
           error: 'You have already applied for this programme',
-          admission: existing[0],
+          admission: duplicate,
         });
       }
 
@@ -182,10 +198,23 @@ class AdmissionController {
         }
       }
 
+      const { error: studentUpdateError } = await supabaseAdmin
+        .from('students')
+        .update({ academic_year: academicYear, updated_at: new Date().toISOString() })
+        .eq('id', student.id);
+      if (studentUpdateError) throw studentUpdateError;
+
+      const { data: studentId, error: studentIdError } = await supabaseAdmin.rpc(
+        'generate_student_id',
+        { p_student_id: student.id }
+      );
+      if (studentIdError) throw studentIdError;
+
       res.status(201).json({
         success: true,
         message: 'Admission started successfully',
         admission,
+        studentId,
       });
     } catch (error) {
       console.error('❌ startAdmission error:', error);

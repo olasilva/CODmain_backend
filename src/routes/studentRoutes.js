@@ -21,7 +21,6 @@ router.get('/my-classes', authenticateToken, studentController.getMyEnrolledClas
 
 // ─── Attendance ───
 router.get('/attendance', authenticateToken, studentController.getMyAttendance);
-router.post('/attendance', authenticateToken, studentController.submitAttendance);
 
 // ─── Fees ───
 router.get('/fees', authenticateToken, studentController.getMyFees);

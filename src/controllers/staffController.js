@@ -1,5 +1,6 @@
 // src/controllers/staffController.js
 const { supabaseAdmin } = require('../config/supabase');
+const { trackCategory } = require('../services/programStructure');
 
 // ═══════════════════════════════════════════════════════════════
 // Helpers
@@ -39,27 +40,14 @@ function admissionMatchesStaff(admission, staffCat, staffLevels) {
     ? staffLevels.map(norm).filter(Boolean)
     : [];
 
-  if (cat && cat !== 'mixed') {
-    const track = norm(admission?.track_name || admission?.course);
-    if (track) {
-      if (cat.includes('regular') || cat.includes('academ')) {
-        if (
-          track.includes('music') &&
-          !track.includes('regular') &&
-          !track.includes('mixed')
-        ) {
-          return false;
-        }
-      } else if (cat.includes('music')) {
-        if (
-          track.includes('regular') &&
-          !track.includes('music') &&
-          !track.includes('mixed')
-        ) {
-          return false;
-        }
-      }
-    }
+  const category = trackCategory(staffCat);
+  const studentCategory = trackCategory(admission?.track_name || admission?.course);
+  if (
+    category !== 'unknown' &&
+    studentCategory !== 'unknown' &&
+    category !== studentCategory
+  ) {
+    return false;
   }
 
   if (levels.length > 0) {
@@ -429,6 +417,13 @@ async function markAttendance(req, res) {
     if (valid.length === 0) {
       return res.status(403).json({
         error: 'None of the students in this list are assigned to you.',
+      });
+    }
+
+    const allowedStatuses = new Set(['present', 'absent', 'late', 'excused']);
+    if (valid.some((record) => !allowedStatuses.has(record.status || 'present'))) {
+      return res.status(400).json({
+        error: 'Attendance status must be present, absent, late, or excused',
       });
     }
 
@@ -1038,6 +1033,15 @@ async function submitResults(req, res) {
   try {
     const { studentId } = req.params;
     const { session, term } = req.body;
+
+    if (!session || !term) {
+      return res.status(400).json({ error: 'session and term are required' });
+    }
+
+    const myStudents = await getMyStudents(req.user.id);
+    if (!myStudents.find((student) => student.id === studentId)) {
+      return res.status(403).json({ error: 'Student is not in your classes' });
+    }
 
     const { data, error } = await supabaseAdmin
       .from('report_cards')

@@ -1,5 +1,6 @@
 // src/services/staffMatching.js
 const { supabaseAdmin } = require('../config/supabase');
+const { trackCategory } = require('./programStructure');
 
 /**
  * Given a student's programme info, find all staff who match.
@@ -15,10 +16,7 @@ const { supabaseAdmin } = require('../config/supabase');
 async function findMatchingStaff(student) {
   if (!student || !student.trackName) return [];
 
-  const track = String(student.trackName).toLowerCase();
-  const isRegular = track.includes('regular');
-  const isMusic = track.includes('music');
-  const isMixed = track.includes('mixed');
+  const category = trackCategory(student.trackName);
 
   // What levels does this student belong to?
   const studentLevels = [];
@@ -28,10 +26,12 @@ async function findMatchingStaff(student) {
   if (!studentLevels.length) return [];
 
   // Build list of categories that could match
-  const candidateCategories = [];
-  if (isRegular) candidateCategories.push('regular');
-  if (isMusic) candidateCategories.push('music');
-  if (isMixed) candidateCategories.push('mixed', 'regular', 'music'); // mixed students can be seen by anyone
+  const candidateCategories = {
+    music: ['music'],
+    academic: ['academic', 'mixed'],
+    mixed_media: ['mixed_media', 'regular'],
+  }[category] || [];
+  if (candidateCategories.length === 0) return [];
 
   // Fetch all staff in candidate categories
   const { data: staff, error } = await supabaseAdmin

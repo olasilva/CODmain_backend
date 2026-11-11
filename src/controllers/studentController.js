@@ -1,6 +1,10 @@
 // src/controllers/studentController.js
 const { supabaseAdmin } = require('../config/supabase');
 const supabaseService = require('../services/supabaseService');
+const {
+  canonicalTrackName,
+  trackCategory,
+} = require('../services/programStructure');
 
 const SCHOOL_BANK_ACCOUNT = {
   bankName: 'Zenith Bank',
@@ -23,7 +27,7 @@ function getAdmissionFeeAmount(admission) {
 async function findStudent(userId) {
   const { data, error } = await supabaseAdmin
     .from('students')
-    .select('id, user_id, student_id, full_name, email, status')
+    .select('id, user_id, student_id, full_name, email, status, level')
     .eq('user_id', userId)
     .order('created_at', { ascending: true })
     .limit(1);
@@ -88,8 +92,9 @@ async function getMyProgramme(req, res) {
       programme: {
         id: adm.id,
         course: adm.course,
-        trackName: adm.track_name,
+        trackName: canonicalTrackName(adm.track_name),
         regularClass: adm.regular_class || null,
+        level: student.level ?? null,
         instrument: adm.instrument || null,
         academicYear: adm.academic_year,
         status: adm.status,
@@ -1099,52 +1104,6 @@ async function getMyAttendance(req, res) {
   }
 }
 
-async function submitAttendance(req, res) {
-  try {
-    const userId = req.user?.id;
-    const { date, course, teacher, status = 'present', notes } = req.body || {};
-
-    if (!date || !course || !teacher) {
-      return res
-        .status(400)
-        .json({ error: 'date, course, and teacher are required' });
-    }
-
-    const student = await findStudent(userId);
-    if (!student) {
-      return res.status(404).json({ error: 'Student record not found' });
-    }
-
-    const allowed = ['present', 'late', 'excused', 'absent'];
-    const finalStatus = allowed.includes(status) ? status : 'present';
-
-    const row = {
-      student_id: student.id,
-      date,
-      course: String(course).trim(),
-      teacher: String(teacher).trim(),
-      status: finalStatus,
-      notes: notes ? String(notes).trim() : null,
-      updated_at: new Date().toISOString(),
-    };
-
-    const { data, error } = await supabaseAdmin
-      .from('attendance')
-      .upsert([row], { onConflict: 'student_id,date,course' })
-      .select()
-      .single();
-
-    if (error) throw error;
-
-    return res.status(201).json({ success: true, attendance: data });
-  } catch (error) {
-    console.error('❌ submitAttendance error:', error.message);
-    return res
-      .status(500)
-      .json({ error: 'Failed to submit attendance', details: error.message });
-  }
-}
-
 // ============ TEACHER MESSAGING ============
 
 async function getMyTeachers(req, res) {
@@ -1285,34 +1244,14 @@ async function getStaffDirectory(req, res) {
     const adm = admRows?.[0] || null;
 
     const norm = (s) => String(s || '').toLowerCase().trim();
-    const studentTrackRaw = norm(adm?.track_name);
+    const studentTrackType = trackCategory(adm?.track_name);
     const studentLevels = [adm?.regular_class, adm?.instrument].filter(Boolean);
 
-    let studentTrackType = 'unknown';
-    if (studentTrackRaw.includes('mixed')) studentTrackType = 'mixed';
-    else if (studentTrackRaw.includes('regular')) studentTrackType = 'regular';
-    else if (studentTrackRaw.includes('music')) studentTrackType = 'music';
-
-    const MUSIC_KEYWORDS = [
-      'music', 'instrument', 'band', 'orchestr', 'choir',
-      'piano', 'keyboard', 'guitar', 'bass', 'violin', 'cello',
-      'flute', 'sax', 'trumpet', 'drum', 'percussion', 'vocal', 'voice', 'sing',
-    ];
-    const REGULAR_KEYWORDS = [
-      'regular', 'academ', 'primary', 'secondar', 'prim', 'sec',
-      'general', 'nursery', 'jss', 'sss', 'rgl',
-    ];
-
-    const hasAny = (h, list) => list.some((k) => h.includes(k));
-    const catLooksMusic = (c) => hasAny(c, MUSIC_KEYWORDS);
-    const catLooksRegular = (c) => hasAny(c, REGULAR_KEYWORDS);
     const catIsUniversal = (c) =>
       !c ||
-      c === 'mixed' ||
       c === 'both' ||
       c === 'all' ||
       c === 'any' ||
-      c.includes('mixed') ||
       c.includes('general');
 
     const { data: allStaff, error } = await supabaseAdmin
@@ -1327,10 +1266,7 @@ async function getStaffDirectory(req, res) {
       const cat = norm(s.staff_category);
       if (catIsUniversal(cat)) return true;
       if (studentTrackType === 'unknown') return true;
-      if (studentTrackType === 'mixed') return true;
-      if (studentTrackType === 'regular') return !catLooksMusic(cat);
-      if (studentTrackType === 'music') return !catLooksRegular(cat);
-      return true;
+      return trackCategory(cat) === studentTrackType;
     });
 
     const wouldPassLevel = (s) => {
@@ -1390,7 +1326,7 @@ async function getStaffDirectory(req, res) {
       email: s.email || null,
       avatar_url: s.avatar_url || null,
       department: s.department || null,
-      category: s.staff_category || null,
+      category: s.staff_category ? canonicalTrackName(s.staff_category) : null,
       levels: Array.isArray(s.staff_levels) ? s.staff_levels : [],
     }));
 
@@ -1615,7 +1551,6 @@ module.exports = {
   getPaymentContext,
   getMyFees,
   getMyAttendance,
-  submitAttendance,
   getMyTeachers,
   getStaffDirectory,
   getConversationWithTeacher,

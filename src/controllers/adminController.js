@@ -1,6 +1,10 @@
 // src/controllers/adminController.js
 const { supabaseAdmin } = require('../config/supabase');
 const { sendMail } = require('../services/emailService');
+const {
+  canonicalTrackName,
+  trackCategory,
+} = require('../services/programStructure');
 
 let bcrypt = null;
 try {
@@ -136,22 +140,14 @@ async function notifyStudentsOfStaffAssignment({
     if (!latest[a.student_id]) latest[a.student_id] = a;
   });
 
-  const track = String(category).toLowerCase();
+  const staffCategory = trackCategory(category);
   const matchedStudentIds = [];
 
   Object.values(latest).forEach((a) => {
-    const studentTrack = String(a.track_name || '').toLowerCase();
+    const studentCategory = trackCategory(a.track_name);
     const studentLevels = [a.regular_class, a.instrument].filter(Boolean);
 
-    if (track === 'regular' && !studentTrack.includes('regular')) return;
-    if (track === 'music' && !studentTrack.includes('music')) return;
-    if (
-      track === 'mixed' &&
-      !studentTrack.includes('mixed') &&
-      !studentTrack.includes('regular') &&
-      !studentTrack.includes('music')
-    )
-      return;
+    if (staffCategory !== 'unknown' && staffCategory !== studentCategory) return;
 
     if (levelList.length > 0) {
       const match = levelList.some((lvl) =>
@@ -208,7 +204,7 @@ class AdminController {
       const { data: rows, error, count } = await supabaseAdmin
         .from('students')
         .select(
-          `id, user_id, student_id, full_name, status, academic_year, created_at,
+          `id, user_id, student_id, full_name, status, academic_year, level, created_at,
            user:users ( id, email, phone, role, avatar_url )`,
           { count: 'exact' }
         )
@@ -234,7 +230,7 @@ class AdminController {
             .order('created_at', { ascending: false }),
           supabaseAdmin
             .from('admissions')
-            .select('student_id, course, track_name, status, created_at')
+            .select('student_id, course, track_name, regular_class, status, created_at')
             .in('student_id', ids)
             .order('created_at', { ascending: false }),
           supabaseAdmin
@@ -301,9 +297,11 @@ class AdminController {
           avatar_url: s.user?.avatar_url || null,
           status: s.status,
           academic_year: s.academic_year,
+          level: s.level,
+          regular_class: adm?.regular_class || null,
           created_at: s.created_at,
           programme: adm?.course
-            ? `${adm.course} · ${adm.track_name || ''}`.trim()
+            ? `${adm.course} · ${canonicalTrackName(adm.track_name)}`.trim()
             : mostRecentPayment?.description || null,
           payment_status: mostRecentPayment?.status || 'none',
           latest_payment_status: mostRecentPayment?.status || 'none',
@@ -774,6 +772,8 @@ class AdminController {
       const { studentId } = req.params;
       const { fullName, email, phone, status, academic_year } = req.body;
       const requestedStudentId = req.body.studentIdNumber ?? req.body.student_id;
+      const requestedLevel = req.body.level;
+      const requestedClass = req.body.regular_class ?? req.body.class;
       const { data: existingStudent, error: existingStudentError } = await supabaseAdmin
         .from('students')
         .select('id, user_id, student_id')
@@ -782,10 +782,32 @@ class AdminController {
       if (existingStudentError) throw existingStudentError;
       if (!existingStudent) return res.status(404).json({ error: 'Student not found' });
 
+      let admissionToUpdate = null;
+      if (requestedClass !== undefined) {
+        const { data: admissions, error: admissionsError } = await supabaseAdmin
+          .from('admissions')
+          .select('id')
+          .eq('student_id', studentId)
+          .order('created_at', { ascending: false })
+          .limit(1);
+        if (admissionsError) throw admissionsError;
+        admissionToUpdate = admissions?.[0] || null;
+        if (!admissionToUpdate) {
+          return res.status(404).json({ error: 'Student admission not found' });
+        }
+      }
+
       const sUpdates = {};
       if (fullName !== undefined) sUpdates.full_name = fullName.trim();
       if (status !== undefined) sUpdates.status = status;
       if (academic_year !== undefined) sUpdates.academic_year = academic_year;
+      if (requestedLevel !== undefined) {
+        const level = Number(requestedLevel);
+        if (!Number.isInteger(level) || level < 0) {
+          return res.status(400).json({ error: 'level must be a non-negative integer' });
+        }
+        sUpdates.level = level;
+      }
       if (requestedStudentId !== undefined) {
         const newStudentId = String(requestedStudentId).trim();
         const { data: admissions, error: admissionError } = await supabaseAdmin
@@ -796,14 +818,11 @@ class AdminController {
           .limit(1);
         if (admissionError) throw admissionError;
         const isMusic = isMusicAdmission(admissions?.[0]?.track_name, admissions?.[0]?.instrument);
-        const validId = isMusic
-          ? /^COD-\d{4}-\d{3,}$/.test(newStudentId)
-          : /^COD-\d{4}\/\d{4}-\d{4,}$/.test(newStudentId);
+        const validId = /^COD-\d{4}\/\d{4}-\d{4,}$/.test(newStudentId) ||
+          (isMusic && /^COD-\d{4}-\d{3,}$/.test(newStudentId));
         if (!validId) {
           return res.status(400).json({
-            error: isMusic
-              ? 'Music student IDs must use COD-YYYY-NNN format'
-              : 'Regular student IDs must use COD-YYYY/YYYY-NNNN format',
+            error: 'Student IDs must use COD-YYYY/YYYY-NNNN format',
           });
         }
         sUpdates.student_id = newStudentId;
@@ -815,6 +834,14 @@ class AdminController {
           .from('students')
           .update(sUpdates)
           .eq('id', studentId);
+        if (error) throw error;
+      }
+
+      if (requestedClass !== undefined) {
+        const { error } = await supabaseAdmin
+          .from('admissions')
+          .update({ regular_class: requestedClass, updated_at: new Date().toISOString() })
+          .eq('id', admissionToUpdate.id);
         if (error) throw error;
       }
 
@@ -2090,7 +2117,12 @@ class AdminController {
 
       res.json({
         success: true,
-        staff,
+        staff: staff.map((member) => ({
+          ...member,
+          staff_category: member.staff_category
+            ? canonicalTrackName(member.staff_category)
+            : null,
+        })),
         total: count || 0,
       });
     } catch (error) {
@@ -2341,12 +2373,18 @@ class AdminController {
       let categoryChanged = false;
 
       if (staff_category !== undefined) {
-        const allowed = ['regular', 'music', 'mixed', null, ''];
-        const newCat = allowed.includes(staff_category)
-          ? staff_category || null
-          : null;
-        updates.staff_category = newCat;
-        if (current.staff_category !== newCat) categoryChanged = true;
+        const newCat = staff_category ? trackCategory(staff_category) : null;
+        if (staff_category && newCat === 'unknown') {
+          return res.status(400).json({
+            error: 'staff_category must be Music, Academic, or Mixed Media',
+          });
+        }
+        updates.staff_category = {
+          music: 'music',
+          academic: 'mixed',
+          mixed_media: 'regular',
+        }[newCat] || null;
+        if (trackCategory(current.staff_category) !== newCat) categoryChanged = true;
       }
 
       if (staff_levels !== undefined) {
@@ -2374,7 +2412,10 @@ class AdminController {
       if (error) throw error;
 
       let notified = 0;
-      const finalCategory = updates.staff_category ?? current.staff_category;
+      const finalCategoryValue = staff_category !== undefined
+        ? trackCategory(staff_category)
+        : trackCategory(current.staff_category);
+      const finalCategory = finalCategoryValue === 'unknown' ? null : finalCategoryValue;
       if (categoryChanged && finalCategory) {
         const finalLevels =
           updates.staff_levels ?? current.staff_levels ?? [];
@@ -2392,7 +2433,12 @@ class AdminController {
       return res.json({
         success: true,
         message: 'Staff updated successfully',
-        staff: data,
+        staff: {
+          ...data,
+          staff_category: data.staff_category
+            ? canonicalTrackName(data.staff_category)
+            : null,
+        },
         notified,
       });
     } catch (error) {
@@ -2494,12 +2540,13 @@ class AdminController {
 
       const map = new Map();
       (data || []).forEach((row) => {
-        const key = `${row.course || ''}||${row.track_name || ''}`;
+        const trackName = canonicalTrackName(row.track_name);
+        const key = `${row.course || ''}||${trackName}`;
         if (!map.has(key)) {
           map.set(key, {
             course: row.course,
-            trackName: row.track_name,
-            label: [row.course, row.track_name].filter(Boolean).join(' · '),
+            trackName,
+            label: [row.course, trackName].filter(Boolean).join(' · '),
           });
         }
       });
